@@ -2,6 +2,7 @@ import {
   Address, Abi, PublicClient, WalletClient, encodeFunctionData, decodeAbiParameters,
   keccak256, encodePacked, Hex, parseEventLogs
 } from "viem";
+import { encodeAbiParameters, parseAbiParameters } from "viem";
 import { readContract } from "viem/actions";
 import PalindromeCryptoEscrowABI from "./contract/PalindromeCryptoEscrow.json";
 import USDTABI from "./contract/USDT.json";
@@ -11,6 +12,10 @@ import {
 } from "./subgraph/queries";
 import { Escrow } from "./types/escrow";
 import { bscTestnet, Chain } from "viem/chains";
+import 'dotenv/config';
+
+const contractAddress = process.env.CONTRACT_ADDRESS as `0x${string}`;
+
 
 /**
  * =================================================================
@@ -53,8 +58,8 @@ export enum EscrowState {
 
 /** Dispute resolution enum */
 export enum DisputeResolution {
-  Complete = 3,
-  Refunded = 4
+  Complete = 3, // seller receives the token
+  Refunded = 4 // buyer receives the token
 }
 
 /** Role enum for participants */
@@ -84,6 +89,7 @@ export enum SDKErrorCode {
   EVIDENCE_ALREADY_SUBMITTED = 'EVIDENCE_ALREADY_SUBMITTED',
   INVALID_RESOLUTION = 'INVALID_RESOLUTION',
 }
+
 
 export class SDKError extends Error {
   code: SDKErrorCode;
@@ -195,6 +201,7 @@ export interface EscrowData {
   amount: bigint;
   depositTime: bigint;
   maturityTime: bigint;
+  nonce: bigint;
   state: EscrowState;
   buyerCancelRequested: boolean;
   sellerCancelRequested: boolean;
@@ -239,6 +246,8 @@ export class PalindromeEscrowSDK {
   private escrowCache: Map<string, { data: any; timestamp: number }> = new Map();
   private readonly CACHE_TTL = 5000; // 5 seconds
 
+
+
   constructor(config: PalindromeEscrowSDKConfig) {
     this.contractAddress = config.contractAddress;
     this.abiEscrow = PalindromeCryptoEscrowABI.abi as Abi;
@@ -250,6 +259,7 @@ export class PalindromeEscrowSDK {
     this.apollo = config.apollo;
     this.chain = config.chain ?? bscTestnet;
   }
+
 
   // ==========================================================================
   // PRIVATE UTILITY METHODS
@@ -310,9 +320,10 @@ export class PalindromeEscrowSDK {
       amount: escrow[4] as bigint,                    // Index 4
       depositTime: escrow[5] as bigint,               // Index 5
       maturityTime: escrow[6] as bigint,              // Index 6
-      state: Number(escrow[7]) as EscrowState,        // Index 7
-      buyerCancelRequested: escrow[8] as boolean,     // Index 8
-      sellerCancelRequested: escrow[9] as boolean,    // Index 9
+      nonce: escrow[7] as bigint,                     // Inex  7
+      state: Number(escrow[8]) as EscrowState,        // Index 8
+      buyerCancelRequested: escrow[9] as boolean,     // Index 9
+      sellerCancelRequested: escrow[10] as boolean,   // Index 10
     };
   }
 
@@ -321,48 +332,47 @@ export class PalindromeEscrowSDK {
    * Build signature message WITHOUT deadline (for confirmDeliverySigned)
    * @private
    */
-  private buildDeliverySignatureMessage(
-    escrowId: bigint,
-    buyer: Address,
-    depositTime: bigint
-  ): Hex {
-    return keccak256(
-      encodePacked(
-        ["address", "uint256", "address", "uint256", "string"],
-        [this.contractAddress, escrowId, buyer, depositTime, "confirmDelivery"]
-      )
-    );
-  }
-
-  /**
-   * Build signature message WITH deadline (for other signed functions)
-   * @private
-   */
-  private buildSignatureMessage(
+  // Correct parameter types for big integers
+  private async buildMessageHash(
+    escrowAddress: Address,
     escrowId: bigint,
     participant: Address,
     depositTime: bigint,
     deadline: bigint,
-    action: string,
-    extraParams?: bigint[]
-  ): Hex {
-    const baseTypes = ["address", "uint256", "address", "uint256", "uint256", "string"];
-    const baseValues: any[] = [
-      this.contractAddress,
-      escrowId,
-      participant,
-      depositTime,
-      deadline,
-      action
-    ];
+    nonce: bigint,
+    method: string
+  ): Promise<`0x${string}`> {
+    const chainId: bigint = BigInt(await this.publicClient.getChainId()); // or use as needed
 
-    if (extraParams && extraParams.length > 0) {
-      extraParams.forEach(() => baseTypes.push("uint256"));
-      baseValues.push(...extraParams);
-    }
+    const abiParams = parseAbiParameters(
+      'uint256, address, uint256, address, uint256, uint256, uint256, string'
+    );
 
-    return keccak256(encodePacked(baseTypes as any, baseValues));
+    // All values must be of primitive type 'bigint'
+    const values: [
+      bigint,        // chainId as bigint
+      `0x${string}`, // escrowAddress
+      bigint,        // escrowId
+      `0x${string}`, // participant
+      bigint,        // depositTime
+      bigint,        // deadline
+      bigint,        // nonce
+      string         // method
+    ] = [
+        chainId,
+        escrowAddress as `0x${string}`,
+        escrowId,
+        participant as `0x${string}`,
+        depositTime,
+        deadline,
+        nonce,
+        method
+      ];
+
+    const encoded = encodeAbiParameters(abiParams, values);
+    return keccak256(encoded);
   }
+
 
   /**
    * Send transaction and wait for confirmation with gas estimation
@@ -800,13 +810,13 @@ export class PalindromeEscrowSDK {
   /**
    * Get escrow status with human-readable state name
    */
-  async getEscrowStatus(escrowId: bigint): Promise<{
+  async getEscrowStatus(escrowId: bigint, forceRefresh?: boolean): Promise<{
     stateValue: number;
     stateName: string;
     escrow: any;
   }> {
-    const escrow = await this.getEscrowDataCached(escrowId);
-    const stateValue = Number(escrow[7]);
+    const escrow = await this.getEscrowDataCached(escrowId, forceRefresh);
+    const stateValue = Number(escrow[8]);
     const stateNames = [
       'AWAITING_PAYMENT',
       'AWAITING_DELIVERY',
@@ -816,7 +826,6 @@ export class PalindromeEscrowSDK {
       'CANCELED'
     ];
     const stateName = stateNames[stateValue] || 'UNKNOWN';
-
     return { stateValue, stateName, escrow };
   }
 
@@ -931,187 +940,97 @@ export class PalindromeEscrowSDK {
     walletClient: WalletClient,
     escrowId: bigint
   ): Promise<Hex> {
-    // Validate wallet client
     assertWalletClient(walletClient);
 
     const accountAddress = this.getAccountAddress(walletClient);
-
-    if (!accountAddress) {
-      throw new SDKError(
-        "Wallet account address not found. Please ensure wallet is properly connected.",
-        SDKErrorCode.WALLET_ACCOUNT_MISSING
-      );
-    }
+    if (!accountAddress) throw new SDKError("Missing buyer address.", SDKErrorCode.WALLET_ACCOUNT_MISSING);
 
     const escrow = await this.getEscrowDataCached(escrowId, true);
     const parsed = this.parseEscrowData(escrow);
 
-    // Validate caller is buyer (case-insensitive comparison)
-    const normalizedCaller = accountAddress.toLowerCase();
-    const normalizedBuyer = parsed.buyer.toLowerCase();
+    // --- PRECHECKS ---
+    if (accountAddress.toLowerCase() !== parsed.buyer.toLowerCase())
+      throw new SDKError(`Only buyer can deposit. Expected: ${parsed.buyer}, Got: ${accountAddress}`, SDKErrorCode.NOT_BUYER);
 
-    if (normalizedCaller !== normalizedBuyer) {
-      throw new SDKError(
-        `Only buyer can deposit. Expected: ${parsed.buyer}, Got: ${accountAddress}`,
-        SDKErrorCode.NOT_BUYER
-      );
-    }
+    if (parsed.state !== EscrowState.AWAITING_PAYMENT)
+      throw new InvalidStateError(EscrowState[parsed.state], EscrowState[EscrowState.AWAITING_PAYMENT]);
 
-    // Validate escrow state
-    if (parsed.state !== EscrowState.AWAITING_PAYMENT) {
-      throw new InvalidStateError(
-        EscrowState[parsed.state],
-        EscrowState[EscrowState.AWAITING_PAYMENT]
-      );
-    }
+    if (!parsed.token || parsed.token === '0x0000000000000000000000000000000000000000')
+      throw new SDKError("Invalid token address in escrow", SDKErrorCode.INVALID_ROLE);
 
-    // Validate token address
-    if (!parsed.token || parsed.token === '0x0000000000000000000000000000000000000000') {
-      throw new SDKError(
-        "Invalid token address in escrow",
-        SDKErrorCode.INVALID_ROLE
-      );
-    }
-
-    // Check USDT balance
     const balance = await this.getUSDTBalanceOf(accountAddress, parsed.token);
+    if (balance < parsed.amount)
+      throw new SDKError(`Insufficient USDT balance. Required: ${parsed.amount}, Available: ${balance}`, SDKErrorCode.INSUFFICIENT_BALANCE);
 
-    if (balance < parsed.amount) {
-      throw new SDKError(
-        `Insufficient USDT balance. Required: ${parsed.amount}, Available: ${balance}`,
-        SDKErrorCode.INSUFFICIENT_BALANCE
-      );
-    }
+    // --- CHECK AND RESET ALLOWANCE ---
+    // Always use BigInt values for comparisons
+    const allowanceData = encodeFunctionData({
+      abi: this.abiUSDT,
+      functionName: "allowance",
+      args: [accountAddress, this.contractAddress],
+    });
+    const allowanceResult = await this.publicClient.call({ to: parsed.token, data: allowanceData });
+    const [currentAllowance] = decodeAbiParameters([{ type: "uint256" }], allowanceResult.data as Hex);
 
-    // Check current allowance
-    let currentAllowance: bigint;
-
-    try {
-      const allowanceData = encodeFunctionData({
+    // If allowance > 0, reset to zero first
+    if (currentAllowance > 0n) {
+      const resetData = encodeFunctionData({
         abi: this.abiUSDT,
-        functionName: "allowance",
-        args: [accountAddress, this.contractAddress],
+        functionName: "approve",
+        args: [this.contractAddress, 0n],
       });
-
-      const allowanceResult = await this.publicClient.call({
+      const resetHash = await walletClient.sendTransaction({
         to: parsed.token,
-        data: allowanceData
+        data: resetData,
+        account: walletClient.account,
+        chain: this.chain,
       });
-
-      if (!allowanceResult?.data || allowanceResult.data === '0x') {
-        throw new Error("Empty allowance response");
-      }
-
-      const [decodedAllowance] = decodeAbiParameters(
-        [{ type: "uint256" }],
-        allowanceResult.data as Hex
-      );
-
-      currentAllowance = decodedAllowance;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      throw new SDKError(
-        `Failed to check token allowance: ${errorMessage}`,
-        SDKErrorCode.ALLOWANCE_FAILED
-      );
+      await this.publicClient.waitForTransactionReceipt({
+        hash: resetHash,
+        confirmations: 1
+      });
+      // Optionally, add a small delay
+      await new Promise(res => setTimeout(res, 2000));
     }
 
-    // Handle token approval if needed
-    if (currentAllowance < parsed.amount) {
-      try {
-        // USDT requires reset to 0 first if current allowance > 0
-        // This is a known USDT quirk to prevent attack vectors
-        if (currentAllowance > 0n) {
-          const resetData = encodeFunctionData({
-            abi: this.abiUSDT,
-            functionName: "approve",
-            args: [this.contractAddress, 0n],
-          });
+    // Approve required amount (after successful reset if needed)
+    const approveData = encodeFunctionData({
+      abi: this.abiUSDT,
+      functionName: "approve",
+      args: [this.contractAddress, parsed.amount],
+    });
+    const approveTxHash = await walletClient.sendTransaction({
+      to: parsed.token,
+      data: approveData,
+      account: walletClient.account,
+      chain: this.chain,
+    });
+    await this.publicClient.waitForTransactionReceipt({
+      hash: approveTxHash,
+      confirmations: 1
+    });
+    // Optionally, add a small delay to ensure state update
+    await new Promise(res => setTimeout(res, 2000));
 
-          const resetHash = await walletClient.sendTransaction({
-            to: parsed.token,
-            data: resetData,
-            account: walletClient.account,
-            chain: this.chain,
-          });
-
-          const resetReceipt = await this.publicClient.waitForTransactionReceipt({
-            hash: resetHash,
-            confirmations: 1
-          });
-
-          if (resetReceipt.status !== 'success') {
-            throw new Error("Failed to reset USDT allowance to zero");
-          }
-        }
-
-        // Approve the required amount
-        const approveData = encodeFunctionData({
-          abi: this.abiUSDT,
-          functionName: "approve",
-          args: [this.contractAddress, parsed.amount],
-        });
-
-        const approveTxHash = await walletClient.sendTransaction({
-          to: parsed.token,
-          data: approveData,
-          account: walletClient.account,
-          chain: this.chain,
-        });
-
-        const approvalReceipt = await this.publicClient.waitForTransactionReceipt({
-          hash: approveTxHash,
-          confirmations: 1
-        });
-
-        if (approvalReceipt.status !== 'success') {
-          throw new Error("Approval transaction failed");
-        }
-
-        // Verify approval was successful
-        const verifyData = encodeFunctionData({
-          abi: this.abiUSDT,
-          functionName: "allowance",
-          args: [accountAddress, this.contractAddress],
-        });
-
-        const verifyResult = await this.publicClient.call({
-          to: parsed.token,
-          data: verifyData
-        });
-
-        if (verifyResult?.data && verifyResult.data !== '0x') {
-          const [newAllowance] = decodeAbiParameters(
-            [{ type: "uint256" }],
-            verifyResult.data as Hex
-          );
-
-          if (newAllowance < parsed.amount) {
-            throw new Error(`Approval verification failed. Expected: ${parsed.amount}, Got: ${newAllowance}`);
-          }
-        }
-
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        throw new SDKError(
-          `Failed to check token allowance: ${errorMessage}`,
-          SDKErrorCode.ALLOWANCE_FAILED
-        );
-      }
+    // --- FINAL ALLOWANCE CHECK ---
+    const verifyData = encodeFunctionData({
+      abi: this.abiUSDT,
+      functionName: "allowance",
+      args: [accountAddress, this.contractAddress],
+    });
+    const verifyResult = await this.publicClient.call({ to: parsed.token, data: verifyData });
+    const [newAllowance] = decodeAbiParameters([{ type: "uint256" }], verifyResult.data as Hex);
+    if (newAllowance < parsed.amount) {
+      throw new SDKError(`Approval verification failed. Expected: ${parsed.amount}, Got: ${newAllowance}`, SDKErrorCode.ALLOWANCE_FAILED);
     }
 
-    // Clear cache to ensure fresh data after deposit
+    // --- EXECUTE DEPOSIT ---
     this.clearCache(escrowId);
-
-    // Execute deposit transaction
     try {
       return await this.sendAndConfirm(walletClient, "deposit", [escrowId]);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      throw new SDKError(
-        `Deposit transaction failed: ${errorMessage}`,
-        SDKErrorCode.TRANSACTION_FAILED
-      );
+      throw new SDKError(`Deposit transaction failed: ${errorMessage}`, SDKErrorCode.TRANSACTION_FAILED);
     }
   }
 
@@ -1121,6 +1040,60 @@ export class PalindromeEscrowSDK {
   async confirmDelivery(walletClient: WalletClient, escrowId: bigint): Promise<Hex> {
     this.clearCache(escrowId);
     return this.sendAndConfirm(walletClient, "confirmDelivery", [escrowId]);
+  }
+
+
+  // Seller or Buser can withdraw
+  async withdraw(
+    walletClient: WalletClient,
+    escrowId: bigint
+  ): Promise<Hex> {
+    assertWalletClient(walletClient);
+
+    // This should be called by buyer or seller, depending on role
+    const accountAddress = this.getAccountAddress(walletClient);
+
+    // Optional: check escrow state before withdraw (can be omitted if you trust contract checks)
+    const escrow = await this.getEscrowDataCached(escrowId, true);
+    const parsed = this.parseEscrowData(escrow);
+
+    console.log(parsed.state)
+
+    if (
+      ![EscrowState.CANCELED, EscrowState.COMPLETE, EscrowState.DISPUTED].includes(parsed.state)
+    ) {
+      throw new SDKError(
+        `Withdrawals only allowed after escrow ends. State: ${EscrowState[parsed.state]}`,
+        SDKErrorCode.INVALID_STATE
+      );
+    }
+
+    // Send the withdraw transaction
+    try {
+      return await this.sendAndConfirm(walletClient, "withdraw", [escrowId]);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new SDKError(`Withdraw transaction failed: ${errorMessage}`, SDKErrorCode.TRANSACTION_FAILED);
+    }
+  }
+
+
+  /**
+   * 
+   * @param id escrow id
+   * @returns returns the escrow deals
+   */
+  async getDeal(id: BigInt) {
+    return await this.publicClient.readContract({
+      address: contractAddress,
+      abi: this.abiEscrow,
+      functionName: 'escrows',
+      args: [id]
+    }) as any;
+  }
+
+  async sign(participantClient: WalletClient, account: Address, hash: `0x${string}`) {
+    return await participantClient.signMessage({ account, message: { raw: hash } });
   }
 
   /**
@@ -1146,12 +1119,13 @@ export class PalindromeEscrowSDK {
       );
     }
 
-    const message = this.buildDeliverySignatureMessage(escrowId, parsed.buyer, parsed.depositTime);
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
+    let deal = await this.getDeal(escrowId);
+    const depositTime = deal[5];
+    const nonce = deal[10];
 
-    const signature = await walletClient.signMessage({
-      account: walletClient.account,
-      message: { raw: message }
-    }) as Hex;
+    const hash = await this.buildMessageHash(contractAddress, escrowId, parsed.buyer, deal[5], deadline, nonce, 'confirmDelivery');
+    const signature = await this.sign(walletClient, parsed.buyer, hash);
 
     this.clearCache(escrowId);
     return this.sendAndConfirm(walletClient, "confirmDeliverySigned", [escrowId, signature]);
@@ -1182,10 +1156,10 @@ export class PalindromeEscrowSDK {
    */
   async requestCancelSigned(
     walletClient: WalletClient,
-    escrowId: bigint,
-    deadline: bigint
+    escrowId: bigint
   ): Promise<Hex> {
     assertWalletClient(walletClient);
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
 
     if (this.isSignatureDeadlineExpired(deadline)) {
       throw new SignatureDeadlineExpiredError();
@@ -1194,18 +1168,13 @@ export class PalindromeEscrowSDK {
     const escrow = await this.getEscrowData(escrowId);
     const parsed = this.parseEscrowData(escrow);
 
-    const message = this.buildSignatureMessage(
-      escrowId,
-      walletClient.account.address,
-      parsed.depositTime,
-      deadline,
-      "cancelRequest"
-    );
+    let deal = await this.getDeal(escrowId);
+    const depositTime = deal[5];
+    const nonce = deal[10];
 
-    const signature = await walletClient.signMessage({
-      account: walletClient.account,
-      message: { raw: message }
-    }) as Hex;
+    const hash = await this.buildMessageHash(contractAddress, escrowId, walletClient.account.address, depositTime, deadline, nonce, 'cancelRequest');
+    const signature = await this.sign(walletClient, parsed.buyer, hash);
+
 
     this.clearCache(escrowId);
     return this.sendAndConfirm(walletClient, "requestCancelSigned", [
@@ -1226,14 +1195,14 @@ export class PalindromeEscrowSDK {
 
 
   /**
- * Watch for newly created escrows for a specific user
- * Returns escrow IDs that may not yet be indexed by TheGraph
- * 
- * @param userAddress - Address of the user (buyer or seller)
- * @param callback - Function called with escrowId when new escrow is detected
- * @param options - Optional configuration
- * @returns EventWatcher with dispose method
- */
+  * Watch for newly created escrows for a specific user
+  * Returns escrow IDs that may not yet be indexed by TheGraph
+  * 
+  * @param userAddress - Address of the user (buyer or seller)
+  * @param callback - Function called with escrowId when new escrow is detected
+  * @param options - Optional configuration
+  * @returns EventWatcher with dispose method
+  */
   watchUserEscrows(
     userAddress: Address,
     callback: (escrowId: bigint, event: EscrowCreatedArgs) => void,
@@ -1334,45 +1303,6 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Start dispute with signature
-   */
-  async startDisputeSigned(
-    walletClient: WalletClient,
-    escrowId: bigint,
-    deadline: bigint
-  ): Promise<Hex> {
-    assertWalletClient(walletClient);
-
-    if (this.isSignatureDeadlineExpired(deadline)) {
-      throw new SignatureDeadlineExpiredError();
-    }
-
-    const escrow = await this.getEscrowData(escrowId);
-    const parsed = this.parseEscrowData(escrow);
-
-    const message = this.buildSignatureMessage(
-      escrowId,
-      walletClient.account.address,
-      parsed.depositTime,
-      deadline,
-      "startDispute"
-    );
-
-    const signature = await walletClient.signMessage({
-      account: walletClient.account,
-      message: { raw: message }
-    }) as Hex;
-
-    this.clearCache(escrowId);
-    return this.sendAndConfirm(walletClient, "startDisputeSigned", [
-      escrowId,
-      walletClient.account.address,
-      deadline,
-      signature
-    ]);
-  }
-
-  /**
    * Submit dispute message/evidence
    */
   async submitDisputeMessage(
@@ -1429,14 +1359,15 @@ export class PalindromeEscrowSDK {
       args: [escrowId]
     }) as number;
 
-    const masks: Record<Role, number> = {
-      [Role.None]: 0,
-      [Role.Buyer]: 1 << 0,
-      [Role.Seller]: 1 << 1,
-      [Role.Arbiter]: 1 << 2
+    const masks: Record<Role, bigint> = {
+      [Role.None]: 0n,
+      [Role.Buyer]: 1n << 0n,
+      [Role.Seller]: 1n << 1n,
+      [Role.Arbiter]: 1n << 2n,
     };
 
-    return (disputeStatus & masks[role]) !== 0;
+    const ds = BigInt(disputeStatus);
+    return (ds & masks[role]) !== 0n;
   }
 
   /**
@@ -1450,9 +1381,11 @@ export class PalindromeEscrowSDK {
       args: [escrowId]
     }) as number;
 
-    const buyer = (disputeStatus & (1 << 0)) !== 0;
-    const seller = (disputeStatus & (1 << 1)) !== 0;
-    const arbiter = (disputeStatus & (1 << 2)) !== 0;
+
+    const ds = BigInt(disputeStatus);
+    const buyer = (ds & (1n << 0n)) !== 0n;
+    const seller = (ds & (1n << 1n)) !== 0n;
+    const arbiter = (ds & (1n << 2n)) !== 0n;
 
     return {
       buyer,
@@ -1474,57 +1407,6 @@ export class PalindromeEscrowSDK {
     return this.sendAndConfirm(walletClient, "resolveDispute", [escrowId, resolution]);
   }
 
-  /**
-   * Resolve dispute with arbiter signature
-   */
-  async resolveDisputeSigned(
-    walletClient: WalletClient,
-    escrowId: bigint,
-    resolution: DisputeResolution,
-    deadline: bigint
-  ): Promise<Hex> {
-    assertWalletClient(walletClient);
-
-    if (this.isSignatureDeadlineExpired(deadline)) {
-      throw new SignatureDeadlineExpiredError();
-    }
-
-    if (resolution !== DisputeResolution.Complete && resolution !== DisputeResolution.Refunded) {
-      throw new SDKError(
-        "Invalid resolution. Must be Complete or Refunded",
-        SDKErrorCode.INVALID_RESOLUTION
-      );
-    }
-
-    const escrow = await this.getEscrowData(escrowId);
-    const parsed = this.parseEscrowData(escrow);
-
-    if (walletClient.account.address.toLowerCase() !== parsed.arbiter.toLowerCase()) {
-      throw new SDKError("Only arbiter can sign dispute resolution", SDKErrorCode.NOT_ARBITER);
-    }
-
-    const message = this.buildSignatureMessage(
-      escrowId,
-      parsed.arbiter,
-      parsed.depositTime,
-      deadline,
-      "resolveDispute",
-      [BigInt(resolution)]
-    );
-
-    const signature = await walletClient.signMessage({
-      account: walletClient.account,
-      message: { raw: message }
-    }) as Hex;
-
-    this.clearCache(escrowId);
-    return this.sendAndConfirm(walletClient, "resolveDisputeSigned", [
-      escrowId,
-      resolution,
-      deadline,
-      signature
-    ]);
-  }
 
   /**
    * Refund escrow (arbiter)
@@ -1534,47 +1416,6 @@ export class PalindromeEscrowSDK {
     return this.sendAndConfirm(walletClient, "refund", [escrowId]);
   }
 
-  /**
-   * Refund with arbiter signature
-   */
-  async refundSigned(
-    walletClient: WalletClient,
-    escrowId: bigint,
-    deadline: bigint
-  ): Promise<Hex> {
-    assertWalletClient(walletClient);
-
-    if (this.isSignatureDeadlineExpired(deadline)) {
-      throw new SignatureDeadlineExpiredError();
-    }
-
-    const escrow = await this.getEscrowData(escrowId);
-    const parsed = this.parseEscrowData(escrow);
-
-    if (walletClient.account.address.toLowerCase() !== parsed.arbiter.toLowerCase()) {
-      throw new SDKError("Only arbiter can sign refund", SDKErrorCode.NOT_ARBITER);
-    }
-
-    const message = this.buildSignatureMessage(
-      escrowId,
-      parsed.arbiter,
-      parsed.depositTime,
-      deadline,
-      "refund"
-    );
-
-    const signature = await walletClient.signMessage({
-      account: walletClient.account,
-      message: { raw: message }
-    }) as Hex;
-
-    this.clearCache(escrowId);
-    return this.sendAndConfirm(walletClient, "refundSigned", [
-      escrowId,
-      deadline,
-      signature
-    ]);
-  }
 
   // ==========================================================================
   // ADMIN METHODS (Owner only)
