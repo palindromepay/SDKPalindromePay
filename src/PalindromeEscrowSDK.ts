@@ -12,9 +12,6 @@ import {
 } from "./subgraph/queries";
 import { Escrow } from "./types/escrow";
 import { bscTestnet, Chain } from "viem/chains";
-import 'dotenv/config';
-
-const contractAddress = process.env.CONTRACT_ADDRESS as `0x${string}`;
 
 
 /**
@@ -207,17 +204,71 @@ export interface EscrowData {
   sellerCancelRequested: boolean;
 }
 
-type EscrowCreatedArgs = {
+export interface EscrowCreatedEvent {
   escrowId: bigint;
-  buyer: string;
-  seller: string;
-  token: string;
+  buyer: Address;
+  seller: Address;
+  token: Address;
   amount: bigint;
-  arbiter: string;
+  arbiter: Address;
   maturityTime: bigint;
   title: string;
   ipfsHash: string;
-};
+}
+
+export interface PaymentDepositedEvent {
+  escrowId: bigint;
+  buyer: Address;
+  amount: bigint;
+  timestamp: bigint;
+}
+
+export interface DisputeStartedEvent {
+  escrowId: bigint;
+  initiator: Address;
+  timestamp: bigint;
+}
+
+export interface DeliveryConfirmedEvent {
+  escrowId: bigint;
+  buyer: Address;
+  seller: Address;
+  amount: bigint;
+  fee: bigint;
+  timestamp: bigint;
+}
+
+export interface DisputeResolvedEvent {
+  escrowId: bigint;
+  resolution: number; // or EscrowState if you like
+  arbiter: Address;
+  amount: bigint;
+  fee: bigint;
+  timestamp: bigint;
+}
+
+export interface DisputeMessagePostedEvent {
+  escrowId: bigint;
+  sender: Address;
+  role: number;
+  ipfsHash: string;
+  disputeStatus: bigint;
+  timestamp: bigint;
+}
+
+export interface RequestCancelEvent {
+  escrowId: bigint;
+  requester: Address;
+  timestamp: bigint;
+}
+
+export interface CanceledEvent {
+  escrowId: bigint;
+  initiator: Address;
+  amount: bigint;
+  fee: bigint;
+  timestamp: bigint;
+}
 
 export interface EventWatcher {
   dispose: () => void;
@@ -245,6 +296,16 @@ export class PalindromeEscrowSDK {
   // Cache for escrow data to reduce RPC calls
   private escrowCache: Map<string, { data: any; timestamp: number }> = new Map();
   private readonly CACHE_TTL = 5000; // 5 seconds
+
+  private readonly STATE_NAMES = [
+    'AWAITING_PAYMENT',
+    'AWAITING_DELIVERY',
+    'DISPUTED',
+    'COMPLETE',
+    'REFUNDED',
+    'CANCELED'
+  ] as const;
+
 
 
 
@@ -298,12 +359,6 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Parse escrow tuple into structured object
-   * @private
-   */
-
-
-  /**
    * Parse escrow tuple array into structured object
    * Contract returns escrow data as array: [token, buyer, seller, arbiter, amount, ...]
    * 
@@ -320,7 +375,7 @@ export class PalindromeEscrowSDK {
       amount: escrow[4] as bigint,                    // Index 4
       depositTime: escrow[5] as bigint,               // Index 5
       maturityTime: escrow[6] as bigint,              // Index 6
-      nonce: escrow[7] as bigint,                     // Inex  7
+      nonce: escrow[7] as bigint,                     // Index 7
       state: Number(escrow[8]) as EscrowState,        // Index 8
       buyerCancelRequested: escrow[9] as boolean,     // Index 9
       sellerCancelRequested: escrow[10] as boolean,   // Index 10
@@ -391,19 +446,19 @@ export class PalindromeEscrowSDK {
       args,
     });
 
-    // Gas estimation with error handling
     try {
-      await this.publicClient.estimateGas({
+      await this.publicClient.simulateContract({
+        address: this.contractAddress,
+        abi: this.abiEscrow,
+        functionName,
+        args,
         account: walletClient.account.address,
-        to: this.contractAddress,
-        data,
       });
     } catch (err: any) {
-      throw new SDKError(
-        `Transaction will fail: ${err.message || 'Unknown reason'}`,
-        SDKErrorCode.TRANSACTION_FAILED
-      );
+      const revertReason = err.cause?.message || err.message || 'Simulation failed';
+      throw new SDKError(`Transaction will revert: ${revertReason}`, SDKErrorCode.TRANSACTION_FAILED);
     }
+
 
     const txHash = await walletClient.sendTransaction({
       to: this.contractAddress,
@@ -810,24 +865,20 @@ export class PalindromeEscrowSDK {
   /**
    * Get escrow status with human-readable state name
    */
-  async getEscrowStatus(escrowId: bigint, forceRefresh?: boolean): Promise<{
+  async getEscrowStatus(
+    escrowId: bigint,
+    forceRefresh?: boolean,
+  ): Promise<{
     stateValue: number;
     stateName: string;
     escrow: any;
   }> {
     const escrow = await this.getEscrowDataCached(escrowId, forceRefresh);
     const stateValue = Number(escrow[8]);
-    const stateNames = [
-      'AWAITING_PAYMENT',
-      'AWAITING_DELIVERY',
-      'DISPUTED',
-      'COMPLETE',
-      'REFUNDED',
-      'CANCELED'
-    ];
-    const stateName = stateNames[stateValue] || 'UNKNOWN';
+    const stateName = this.STATE_NAMES[stateValue] ?? 'UNKNOWN';
     return { stateValue, stateName, escrow };
   }
+
 
   /**
    * Get UI-friendly escrow status label with color
@@ -837,37 +888,44 @@ export class PalindromeEscrowSDK {
       [EscrowState.AWAITING_PAYMENT]: {
         label: 'Awaiting Payment',
         color: 'orange',
-        description: 'Buyer needs to deposit funds'
+        description: 'Buyer needs to deposit funds',
       },
       [EscrowState.AWAITING_DELIVERY]: {
         label: 'Awaiting Delivery',
         color: 'blue',
-        description: 'Seller should deliver product/service'
+        description: 'Seller should deliver product/service',
       },
       [EscrowState.DISPUTED]: {
         label: 'Disputed',
         color: 'red',
-        description: 'Dispute in progress - arbiter will resolve'
+        description: 'Dispute in progress - arbiter will resolve',
       },
       [EscrowState.COMPLETE]: {
         label: 'Complete',
         color: 'green',
-        description: 'Transaction completed successfully'
+        description: 'Transaction completed successfully',
       },
       [EscrowState.REFUNDED]: {
         label: 'Refunded',
         color: 'gray',
-        description: 'Funds returned to buyer'
+        description: 'Funds returned to buyer',
       },
       [EscrowState.CANCELED]: {
         label: 'Canceled',
         color: 'gray',
-        description: 'Escrow was canceled'
+        description: 'Escrow was canceled',
       },
     };
 
-    return labels[state];
+    return (
+      labels[state] ?? {
+        label: 'Unknown',
+        color: 'gray',
+        description: 'Unknown escrow state',
+      }
+    );
   }
+
 
   /**
    * Check if escrow is in expected state
@@ -919,7 +977,7 @@ export class PalindromeEscrowSDK {
       abi: this.abiEscrow,
       eventName: 'EscrowCreated',
       logs: receipt.logs
-    }) as Array<{ args: EscrowCreatedArgs }>;
+    }) as Array<{ args: EscrowCreatedEvent }>;
 
     if (escrowEvents.length > 0) {
       const event = escrowEvents[0].args;
@@ -936,47 +994,61 @@ export class PalindromeEscrowSDK {
   /**
    * Deposit funds into escrow (auto-fetches token and amount)
    */
-  async deposit(
-    walletClient: WalletClient,
-    escrowId: bigint
-  ): Promise<Hex> {
+  async deposit(walletClient: WalletClient, escrowId: bigint): Promise<Hex> {
     assertWalletClient(walletClient);
 
     const accountAddress = this.getAccountAddress(walletClient);
-    if (!accountAddress) throw new SDKError("Missing buyer address.", SDKErrorCode.WALLET_ACCOUNT_MISSING);
+    if (!accountAddress) {
+      throw new SDKError('Missing buyer address.', SDKErrorCode.WALLET_ACCOUNT_MISSING);
+    }
 
     const escrow = await this.getEscrowDataCached(escrowId, true);
     const parsed = this.parseEscrowData(escrow);
 
-    // --- PRECHECKS ---
-    if (accountAddress.toLowerCase() !== parsed.buyer.toLowerCase())
-      throw new SDKError(`Only buyer can deposit. Expected: ${parsed.buyer}, Got: ${accountAddress}`, SDKErrorCode.NOT_BUYER);
+    if (accountAddress.toLowerCase() !== parsed.buyer.toLowerCase()) {
+      throw new SDKError(
+        `Only buyer can deposit. Expected: ${parsed.buyer}, Got: ${accountAddress}`,
+        SDKErrorCode.NOT_BUYER,
+      );
+    }
 
-    if (parsed.state !== EscrowState.AWAITING_PAYMENT)
-      throw new InvalidStateError(EscrowState[parsed.state], EscrowState[EscrowState.AWAITING_PAYMENT]);
+    if (parsed.state !== EscrowState.AWAITING_PAYMENT) {
+      throw new InvalidStateError(
+        EscrowState[parsed.state],
+        EscrowState[EscrowState.AWAITING_PAYMENT],
+      );
+    }
 
-    if (!parsed.token || parsed.token === '0x0000000000000000000000000000000000000000')
-      throw new SDKError("Invalid token address in escrow", SDKErrorCode.INVALID_ROLE);
+    if (!parsed.token || parsed.token === '0x0000000000000000000000000000000000000000') {
+      throw new SDKError('Invalid token address in escrow', SDKErrorCode.INVALID_ROLE);
+    }
 
     const balance = await this.getUSDTBalanceOf(accountAddress, parsed.token);
-    if (balance < parsed.amount)
-      throw new SDKError(`Insufficient USDT balance. Required: ${parsed.amount}, Available: ${balance}`, SDKErrorCode.INSUFFICIENT_BALANCE);
+    if (balance < parsed.amount) {
+      throw new SDKError(
+        `Insufficient USDT balance. Required: ${parsed.amount}, Available: ${balance}`,
+        SDKErrorCode.INSUFFICIENT_BALANCE,
+      );
+    }
 
-    // --- CHECK AND RESET ALLOWANCE ---
-    // Always use BigInt values for comparisons
+    // Check current allowance
     const allowanceData = encodeFunctionData({
       abi: this.abiUSDT,
-      functionName: "allowance",
+      functionName: 'allowance',
       args: [accountAddress, this.contractAddress],
     });
     const allowanceResult = await this.publicClient.call({ to: parsed.token, data: allowanceData });
-    const [currentAllowance] = decodeAbiParameters([{ type: "uint256" }], allowanceResult.data as Hex);
+    const [currentAllowance] = decodeAbiParameters(
+      [{ type: 'uint256' }],
+      allowanceResult.data as Hex,
+    );
+    const current = BigInt(currentAllowance);
 
-    // If allowance > 0, reset to zero first
-    if (currentAllowance > 0n) {
+    // Reset to zero if needed (USDT-style tokens may require this pattern)
+    if (current > 0n) {
       const resetData = encodeFunctionData({
         abi: this.abiUSDT,
-        functionName: "approve",
+        functionName: 'approve',
         args: [this.contractAddress, 0n],
       });
       const resetHash = await walletClient.sendTransaction({
@@ -985,18 +1057,13 @@ export class PalindromeEscrowSDK {
         account: walletClient.account,
         chain: this.chain,
       });
-      await this.publicClient.waitForTransactionReceipt({
-        hash: resetHash,
-        confirmations: 1
-      });
-      // Optionally, add a small delay
-      await new Promise(res => setTimeout(res, 2000));
+      await this.publicClient.waitForTransactionReceipt({ hash: resetHash, confirmations: 1 });
     }
 
-    // Approve required amount (after successful reset if needed)
+    // Approve required amount
     const approveData = encodeFunctionData({
       abi: this.abiUSDT,
-      functionName: "approve",
+      functionName: 'approve',
       args: [this.contractAddress, parsed.amount],
     });
     const approveTxHash = await walletClient.sendTransaction({
@@ -1005,34 +1072,37 @@ export class PalindromeEscrowSDK {
       account: walletClient.account,
       chain: this.chain,
     });
-    await this.publicClient.waitForTransactionReceipt({
-      hash: approveTxHash,
-      confirmations: 1
-    });
-    // Optionally, add a small delay to ensure state update
-    await new Promise(res => setTimeout(res, 2000));
+    await this.publicClient.waitForTransactionReceipt({ hash: approveTxHash, confirmations: 1 });
 
-    // --- FINAL ALLOWANCE CHECK ---
+    // Final allowance verification
     const verifyData = encodeFunctionData({
       abi: this.abiUSDT,
-      functionName: "allowance",
+      functionName: 'allowance',
       args: [accountAddress, this.contractAddress],
     });
     const verifyResult = await this.publicClient.call({ to: parsed.token, data: verifyData });
-    const [newAllowance] = decodeAbiParameters([{ type: "uint256" }], verifyResult.data as Hex);
-    if (newAllowance < parsed.amount) {
-      throw new SDKError(`Approval verification failed. Expected: ${parsed.amount}, Got: ${newAllowance}`, SDKErrorCode.ALLOWANCE_FAILED);
+    const [newAllowance] = decodeAbiParameters(
+      [{ type: 'uint256' }],
+      verifyResult.data as Hex,
+    );
+    const updated = BigInt(newAllowance);
+    if (updated < parsed.amount) {
+      throw new SDKError(
+        `Approval verification failed. Expected: ${parsed.amount}, Got: ${updated}`,
+        SDKErrorCode.ALLOWANCE_FAILED,
+      );
     }
 
-    // --- EXECUTE DEPOSIT ---
+    // Execute deposit
     this.clearCache(escrowId);
     try {
-      return await this.sendAndConfirm(walletClient, "deposit", [escrowId]);
+      return await this.sendAndConfirm(walletClient, 'deposit', [escrowId]);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       throw new SDKError(`Deposit transaction failed: ${errorMessage}`, SDKErrorCode.TRANSACTION_FAILED);
     }
   }
+
 
   /**
    * Confirm delivery (buyer)
@@ -1057,10 +1127,8 @@ export class PalindromeEscrowSDK {
     const escrow = await this.getEscrowDataCached(escrowId, true);
     const parsed = this.parseEscrowData(escrow);
 
-    console.log(parsed.state)
-
     if (
-      ![EscrowState.CANCELED, EscrowState.COMPLETE, EscrowState.DISPUTED].includes(parsed.state)
+      ![EscrowState.CANCELED, EscrowState.COMPLETE, EscrowState.REFUNDED].includes(parsed.state)
     ) {
       throw new SDKError(
         `Withdrawals only allowed after escrow ends. State: ${EscrowState[parsed.state]}`,
@@ -1068,7 +1136,6 @@ export class PalindromeEscrowSDK {
       );
     }
 
-    // Send the withdraw transaction
     try {
       return await this.sendAndConfirm(walletClient, "withdraw", [escrowId]);
     } catch (error) {
@@ -1083,12 +1150,12 @@ export class PalindromeEscrowSDK {
    * @param id escrow id
    * @returns returns the escrow deals
    */
-  async getDeal(id: BigInt) {
-    return await this.publicClient.readContract({
-      address: contractAddress,
+  async getDeal(id: bigint) {
+    return this.publicClient.readContract({
+      address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: 'escrows',
-      args: [id]
+      args: [id],
     }) as any;
   }
 
@@ -1099,19 +1166,15 @@ export class PalindromeEscrowSDK {
   /**
    * Confirm delivery with signature (off-chain signing)
    */
-  async confirmDeliverySigned(
-    walletClient: WalletClient,
-    escrowId: bigint
-  ): Promise<Hex> {
+  async confirmDeliverySigned(walletClient: WalletClient, escrowId: bigint): Promise<Hex> {
     assertWalletClient(walletClient);
 
-    const escrow = await this.getEscrowDataCached(escrowId);
+    const escrow = await this.getEscrowDataCached(escrowId, true);
     const parsed = this.parseEscrowData(escrow);
 
     if (walletClient.account.address.toLowerCase() !== parsed.buyer.toLowerCase()) {
       throw new SDKError('Only buyer can confirm delivery', SDKErrorCode.NOT_BUYER);
     }
-
     if (parsed.state !== EscrowState.AWAITING_DELIVERY) {
       throw new InvalidStateError(
         EscrowState[parsed.state],
@@ -1119,17 +1182,29 @@ export class PalindromeEscrowSDK {
       );
     }
 
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
-    let deal = await this.getDeal(escrowId);
-    const depositTime = deal[5];
-    const nonce = deal[10];
-
-    const hash = await this.buildMessageHash(contractAddress, escrowId, parsed.buyer, deal[5], deadline, nonce, 'confirmDelivery');
-    const signature = await this.sign(walletClient, parsed.buyer, hash);
+    const deadline = this.createSignatureDeadline(60); // e.g. 60 minutes
+    const nonce = parsed.nonce;
+    const sender = walletClient.account.address;
+    const hash = await this.buildMessageHash(
+      this.contractAddress,
+      escrowId,
+      sender,
+      parsed.depositTime,
+      deadline,
+      nonce,
+      'confirmDelivery'
+    );
+    const signature = await this.sign(walletClient, sender, hash);
 
     this.clearCache(escrowId);
-    return this.sendAndConfirm(walletClient, "confirmDeliverySigned", [escrowId, signature]);
+    return this.sendAndConfirm(walletClient, "confirmDeliverySigned", [
+      escrowId,
+      signature,
+      deadline,
+      nonce,
+    ]);
   }
+
 
   /**
    * Auto-release funds after maturity deadline
@@ -1154,36 +1229,45 @@ export class PalindromeEscrowSDK {
   /**
    * Request cancellation with signature
    */
-  async requestCancelSigned(
-    walletClient: WalletClient,
-    escrowId: bigint
-  ): Promise<Hex> {
+  async requestCancelSigned(walletClient: WalletClient, escrowId: bigint): Promise<Hex> {
     assertWalletClient(walletClient);
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
 
+    const deadline = this.createSignatureDeadline(60);
     if (this.isSignatureDeadlineExpired(deadline)) {
       throw new SignatureDeadlineExpiredError();
     }
 
-    const escrow = await this.getEscrowData(escrowId);
+    const escrow = await this.getEscrowDataCached(escrowId, true);
     const parsed = this.parseEscrowData(escrow);
 
-    let deal = await this.getDeal(escrowId);
-    const depositTime = deal[5];
-    const nonce = deal[10];
+    const caller = walletClient.account.address.toLowerCase();
+    const isBuyer = caller === parsed.buyer.toLowerCase();
+    const isSeller = caller === parsed.seller.toLowerCase();
+    if (!isBuyer && !isSeller) {
+      throw new SDKError("Caller must be buyer or seller", SDKErrorCode.INVALID_ROLE);
+    }
 
-    const hash = await this.buildMessageHash(contractAddress, escrowId, walletClient.account.address, depositTime, deadline, nonce, 'cancelRequest');
-    const signature = await this.sign(walletClient, parsed.buyer, hash);
-
+    const nonce = parsed.nonce;
+    const hash = await this.buildMessageHash(
+      this.contractAddress,
+      escrowId,
+      walletClient.account.address,
+      parsed.depositTime,
+      deadline,
+      nonce,
+      'cancelRequest'
+    );
+    const signature = await this.sign(walletClient, walletClient.account.address, hash);
 
     this.clearCache(escrowId);
     return this.sendAndConfirm(walletClient, "requestCancelSigned", [
       escrowId,
-      walletClient.account.address,
+      signature,
       deadline,
-      signature
+      nonce,
     ]);
   }
+
 
   /**
    * Cancel escrow by timeout (after cancellation request period)
@@ -1205,7 +1289,7 @@ export class PalindromeEscrowSDK {
   */
   watchUserEscrows(
     userAddress: Address,
-    callback: (escrowId: bigint, event: EscrowCreatedArgs) => void,
+    callback: (escrowId: bigint, event: EscrowCreatedEvent) => void,
     options?: {
       onlyAsBuyer?: boolean;
       onlyAsSeller?: boolean;
@@ -1221,7 +1305,7 @@ export class PalindromeEscrowSDK {
       onLogs: (logs) => {
         logs.forEach((log: any) => {
           if (log.args) {
-            const event = log.args as EscrowCreatedArgs;
+            const event = log.args as EscrowCreatedEvent;
             const isBuyer = event.buyer.toLowerCase() === normalizedAddress;
             const isSeller = event.seller.toLowerCase() === normalizedAddress;
 
@@ -1265,14 +1349,6 @@ export class PalindromeEscrowSDK {
   }> {
     const escrow = await this.getEscrowById(escrowId);
     const parsed = this.parseEscrowData(escrow);
-    const stateNames = [
-      'AWAITING_PAYMENT',
-      'AWAITING_DELIVERY',
-      'DISPUTED',
-      'COMPLETE',
-      'REFUNDED',
-      'CANCELED'
-    ];
 
     return {
       id: escrowId.toString(),
@@ -1282,13 +1358,14 @@ export class PalindromeEscrowSDK {
       amount: parsed.amount,
       token: parsed.token,
       state: parsed.state,
-      stateName: stateNames[parsed.state],
+      stateName: this.STATE_NAMES[parsed.state] ?? 'UNKNOWN',
       maturityTime: parsed.maturityTime,
       depositTime: parsed.depositTime,
       buyerCancelRequested: parsed.buyerCancelRequested,
       sellerCancelRequested: parsed.sellerCancelRequested,
     };
   }
+
 
   // ==========================================================================
   // DISPUTE METHODS
@@ -1464,7 +1541,7 @@ export class PalindromeEscrowSDK {
    * Watch for EscrowCreated events
    */
   watchEscrowCreated(
-    callback: (event: EscrowCreatedArgs) => void,
+    callback: (event: EscrowCreatedEvent) => void,
     fromBlock?: bigint
   ): EventWatcher {
     const unwatch = this.publicClient.watchContractEvent({
