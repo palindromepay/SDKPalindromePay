@@ -27,9 +27,10 @@ import { bscTestnet, Chain } from "viem/chains";
  *   uint256 amount;                  // Index 4
  *   uint256 depositTime;             // Index 5
  *   uint256 maturityTime;            // Index 6
- *   State state;                     // Index 7
- *   bool buyerCancelRequested;       // Index 8
- *   bool sellerCancelRequested;      // Index 9
+ *   uint256 nonce;                   // INdex 7
+ *   State state;                     // Index 8
+ *   bool buyerCancelRequested;       // Index 9
+ *   bool sellerCancelRequested;      // Index 10
  * }
  * 
  * Usage:
@@ -50,7 +51,8 @@ export enum EscrowState {
   DISPUTED,
   COMPLETE,
   REFUNDED,
-  CANCELED
+  CANCELED,
+  WITHDRAWN
 }
 
 /** Dispute resolution enum */
@@ -85,6 +87,7 @@ export enum SDKErrorCode {
   INVALID_ROLE = 'INVALID_ROLE',
   EVIDENCE_ALREADY_SUBMITTED = 'EVIDENCE_ALREADY_SUBMITTED',
   INVALID_RESOLUTION = 'INVALID_RESOLUTION',
+  AWAITING_DELIVERY = "AWAITING_DELIVERY",
 }
 
 
@@ -153,6 +156,7 @@ export interface CreateEscrowParams {
   buyer: Address;
   amount: bigint;
   maturityTimeDays?: bigint;
+  arbiter?: Address;
   title: string;
   ipfsHash?: string;
 }
@@ -240,7 +244,7 @@ export interface DeliveryConfirmedEvent {
 
 export interface DisputeResolvedEvent {
   escrowId: bigint;
-  resolution: number; // or EscrowState if you like
+  resolution: number;
   arbiter: Address;
   amount: bigint;
   fee: bigint;
@@ -289,7 +293,6 @@ export class PalindromeEscrowSDK {
   apollo: ApolloClient;
   chain: Chain;
 
-  // Fee constants (matches contract)
   private readonly FEE_BPS = 100n; // 1% = 100 basis points
   private readonly BPS_DENOMINATOR = 10000n;
 
@@ -303,11 +306,9 @@ export class PalindromeEscrowSDK {
     'DISPUTED',
     'COMPLETE',
     'REFUNDED',
-    'CANCELED'
+    'CANCELED',
+    'WITHDRAWN'
   ] as const;
-
-
-
 
   constructor(config: PalindromeEscrowSDKConfig) {
     this.contractAddress = config.contractAddress;
@@ -321,7 +322,6 @@ export class PalindromeEscrowSDK {
     this.chain = config.chain ?? bscTestnet;
   }
 
-
   // ==========================================================================
   // PRIVATE UTILITY METHODS
   // ==========================================================================
@@ -330,7 +330,7 @@ export class PalindromeEscrowSDK {
    * Get escrow data with caching
    * @private
    */
-  private async getEscrowDataCached(escrowId: bigint, forceRefresh = false): Promise<any> {
+  private async getEscrowDataCached(escrowId: bigint, forceRefresh = true): Promise<any> {
     const key = escrowId.toString();
     const now = Date.now();
 
@@ -340,7 +340,6 @@ export class PalindromeEscrowSDK {
         return cached.data;
       }
     }
-
     const data = await this.getEscrowById(escrowId);
     this.escrowCache.set(key, { data, timestamp: now });
     return data;
@@ -356,6 +355,14 @@ export class PalindromeEscrowSDK {
     } else {
       this.escrowCache.clear();
     }
+  }
+
+  /**
+   * Clear cache for all
+   * @public
+   */
+  public clearAllEscrowCache(): void {
+    this.escrowCache.clear();
   }
 
   /**
@@ -381,7 +388,6 @@ export class PalindromeEscrowSDK {
       sellerCancelRequested: escrow[10] as boolean,   // Index 10
     };
   }
-
 
   /**
    * Build signature message WITHOUT deadline (for confirmDeliverySigned)
@@ -427,7 +433,6 @@ export class PalindromeEscrowSDK {
     const encoded = encodeAbiParameters(abiParams, values);
     return keccak256(encoded);
   }
-
 
   /**
    * Send transaction and wait for confirmation with gas estimation
@@ -563,7 +568,7 @@ export class PalindromeEscrowSDK {
   async getEscrowsByBuyer(buyer: string): Promise<Escrow[]> {
     const { data } = await this.apollo.query<{ escrows: Escrow[] }>({
       query: ESCROWS_BY_BUYER_QUERY,
-      variables: { buyer },
+      variables: { buyer: buyer.toLowerCase() },  // ← Add .toLowerCase()
       fetchPolicy: "network-only"
     });
     return data?.escrows ?? [];
@@ -575,7 +580,7 @@ export class PalindromeEscrowSDK {
   async getEscrowsBySeller(seller: string): Promise<Escrow[]> {
     const { data } = await this.apollo.query<{ escrows: Escrow[] }>({
       query: ESCROWS_BY_SELLER_QUERY,
-      variables: { seller },
+      variables: { seller: seller.toLowerCase() },
       fetchPolicy: "network-only"
     });
     return data?.escrows ?? [];
@@ -724,6 +729,24 @@ export class PalindromeEscrowSDK {
     };
   }
 
+  async previewFees(token: Address): Promise<bigint> {
+    const claimable = await readContract(this.publicClient, {
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: "previewFees",
+      args: [token],
+    });
+    return claimable as bigint;
+  }
+
+  async previewFeesFormatted(token: Address): Promise<string> {
+    const [claimable, decimals] = await Promise.all([
+      this.previewFees(token),
+      this.getTokenDecimals(token),
+    ]);
+    return this.formatTokenAmount(claimable, decimals);
+  }
+
   // ==========================================================================
   // MATURITY TIME UTILITIES
   // ==========================================================================
@@ -782,6 +805,7 @@ export class PalindromeEscrowSDK {
     return `${minutes}m remaining`;
   }
 
+
   /**
    * Format maturity days for display
    */
@@ -824,19 +848,6 @@ export class PalindromeEscrowSDK {
     };
   }
 
-  /**
-   * Check if auto-release is available
-   */
-  async canAutoRelease(escrowId: bigint): Promise<boolean> {
-    const escrow = await this.getEscrowDataCached(escrowId);
-    const parsed = this.parseEscrowData(escrow);
-
-    if (parsed.state !== EscrowState.AWAITING_DELIVERY) return false;
-    if (!parsed.depositTime || parsed.depositTime === 0n) return false;
-    if (!parsed.maturityTime || parsed.maturityTime === 0n) return false;
-
-    return this.isDeadlinePassed(parsed.depositTime, parsed.maturityTime);
-  }
 
   // ==========================================================================
   // SIGNATURE UTILITIES
@@ -915,6 +926,11 @@ export class PalindromeEscrowSDK {
         color: 'gray',
         description: 'Escrow was canceled',
       },
+      [EscrowState.WITHDRAWN]: {
+        label: 'Withdrawn',
+        color: 'gray',
+        description: 'Withdrawn',
+      },
     };
 
     return (
@@ -955,6 +971,8 @@ export class PalindromeEscrowSDK {
       );
     }
 
+    const arbiter = (params.arbiter ?? "0x0000000000000000000000000000000000000000") as Address;
+
     const hash = await walletClient.writeContract({
       address: this.contractAddress,
       abi: this.abiEscrow,
@@ -964,6 +982,7 @@ export class PalindromeEscrowSDK {
         params.buyer,
         params.amount,
         maturityTimeDays,
+        arbiter,
         params.title,
         ipfsHash
       ],
@@ -971,7 +990,7 @@ export class PalindromeEscrowSDK {
       chain: this.chain
     });
 
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash, confirmations: 3 });
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
 
     const escrowEvents = parseEventLogs({
       abi: this.abiEscrow,
@@ -1031,7 +1050,6 @@ export class PalindromeEscrowSDK {
       );
     }
 
-    // Check current allowance
     const allowanceData = encodeFunctionData({
       abi: this.abiUSDT,
       functionName: 'allowance',
@@ -1103,17 +1121,11 @@ export class PalindromeEscrowSDK {
     }
   }
 
-
-  /**
-   * Confirm delivery (buyer)
-   */
   async confirmDelivery(walletClient: WalletClient, escrowId: bigint): Promise<Hex> {
     this.clearCache(escrowId);
     return this.sendAndConfirm(walletClient, "confirmDelivery", [escrowId]);
   }
 
-
-  // Seller or Buser can withdraw
   async withdraw(
     walletClient: WalletClient,
     escrowId: bigint
@@ -1203,15 +1215,6 @@ export class PalindromeEscrowSDK {
       deadline,
       nonce,
     ]);
-  }
-
-
-  /**
-   * Auto-release funds after maturity deadline
-   */
-  async autoRelease(walletClient: WalletClient, escrowId: bigint): Promise<Hex> {
-    this.clearCache(escrowId);
-    return this.sendAndConfirm(walletClient, "autoRelease", [escrowId]);
   }
 
   // ==========================================================================
@@ -1473,17 +1476,58 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Resolve dispute (arbiter)
+   * Arbiter: submit decision + evidence in a single atomic transaction.
+   *
+   * resolution:
+   *  - DisputeResolution.Complete  → seller wins (COMPLETE)
+   *  - DisputeResolution.Refunded → buyer wins (REFUNDED)
+   *
+   * ipfsHash: IPFS hash of arbiter evidence JSON (message + files).
    */
-  async resolveDispute(
+  async submitArbiterDecision(
     walletClient: WalletClient,
     escrowId: bigint,
-    resolution: DisputeResolution
+    resolution: DisputeResolution,
+    ipfsHash: string,
   ): Promise<Hex> {
-    this.clearCache(escrowId);
-    return this.sendAndConfirm(walletClient, "resolveDispute", [escrowId, resolution]);
-  }
+    assertWalletClient(walletClient);
 
+    if (
+      resolution !== DisputeResolution.Complete &&
+      resolution !== DisputeResolution.Refunded
+    ) {
+      throw new SDKError(
+        'Resolution must be COMPLETE or REFUNDED',
+        SDKErrorCode.INVALID_STATE,
+      );
+    }
+
+    if (!ipfsHash || !ipfsHash.trim()) {
+      throw new SDKError('IPFS hash is required', SDKErrorCode.INVALID_STATE);
+    }
+
+    const escrow = await this.getEscrowDataCached(escrowId, true);
+    const parsed = this.parseEscrowData(escrow);
+
+    const caller = walletClient.account.address.toLowerCase();
+    if (caller !== parsed.arbiter.toLowerCase()) {
+      throw new SDKError('Only arbiter can submit decision', SDKErrorCode.INVALID_ROLE);
+    }
+    if (parsed.state !== EscrowState.DISPUTED) {
+      throw new InvalidStateError(
+        EscrowState[parsed.state],
+        EscrowState[EscrowState.DISPUTED],
+      );
+    }
+
+    this.clearCache(escrowId);
+
+    return this.sendAndConfirm(walletClient, 'submitArbiterDecision', [
+      escrowId,
+      resolution,
+      ipfsHash,
+    ]);
+  }
 
   /**
    * Refund escrow (arbiter)
