@@ -1,6 +1,6 @@
 {
   "name": "@palindromecryptoescrow/sdk",
-  "version": "1.4.8",
+  "version": "1.6.9",
   "description": "",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
