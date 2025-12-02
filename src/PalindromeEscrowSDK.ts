@@ -1,3 +1,5 @@
+// Copyright (c) 2025 Palindrome Finance
+// Licensed under the MIT License. See LICENSE file for details.
 import {
   Address, Abi, PublicClient, WalletClient, encodeFunctionData, decodeAbiParameters,
   keccak256, Hex, parseEventLogs, parseAbiParameters, encodeAbiParameters, toBytes
