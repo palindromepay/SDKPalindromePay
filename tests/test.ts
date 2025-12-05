@@ -52,13 +52,14 @@ import { ApolloClient, HttpLink, InMemoryCache } from '@apollo/client/core';
 import {
     PalindromeEscrowSDK,
     CreateEscrowParams,
+    CreateEscrowAndDepositParams,
     Role,
     DisputeResolution,
     SDKError,
     SDKErrorCode,
     EscrowData,
-    EscrowState // ✅ Import EscrowState
-} from '../src/PalindromeEscrowSDK'; // ✅ Updated import path
+    EscrowState
+} from '../src/PalindromeEscrowSDK';
 
 // ========== ENV VARS ==========
 
@@ -122,16 +123,15 @@ const apollo = new ApolloClient({
     cache: new InMemoryCache(),
 });
 
-// ✅ Initialize SDK with optimizations
+
 const sdk = new PalindromeEscrowSDK({
     publicClient,
-    contractAddress,       // ✅ IMPORTANT: Use contract address from env
+    contractAddress,
     buyerWalletClient,
     sellerWalletClient,
-    walletClient: buyerWalletClient, // ✅ Add general wallet client
+    walletClient: buyerWalletClient,
     apollo,
     chain,
-    // ✅ NEW: Optimization options
     cacheTTL: 5000,        // 5 second cache
     enableRetry: true,     // Enable retry logic
     maxRetries: 3,         // Max 3 retries
@@ -166,8 +166,26 @@ async function createEscrow(maturityTimeDays: bigint) {
 
     const result = await sdk.createEscrow(sellerWalletClient, params);
     console.log('> createEscrow tx done, id:', result.escrowId?.toString());
+    const stats = sdk.getCacheStats();
+    console.log('Cache stats:', stats);
 
-    // ✅ NEW: Log cache stats after creation
+    return result.escrowId;
+}
+async function createEscrowAndDeposit(maturityTimeDays: bigint) {
+    console.log('> createEscrow start');
+    const amount = 10n * 1_000_000n;
+    const params: CreateEscrowAndDepositParams = {
+        token: USDT,
+        seller: sellerWalletClient.account!.address,
+        amount,
+        maturityTimeDays,
+        arbiter: arbiterAccount.address,
+        title: 'Test Title',
+        ipfsHash: 'Qm...',
+    };
+
+    const result = await sdk.createEscrowAndDeposit(sellerWalletClient, params);
+    console.log('> createEscrow tx done, id:', result.escrowId?.toString());
     const stats = sdk.getCacheStats();
     console.log('Cache stats:', stats);
 
@@ -191,7 +209,6 @@ async function testDepositEscrow(escrowId: bigint) {
     let buyerBalance = await sdk.getUSDTBalanceOf(buyer, USDT);
     console.log('Buyer USDT balance before:', buyerBalance.toString());
 
-    // Fund buyer with USDT from DEPLOYER (USDT minter) if needed
     if (buyerBalance < amount) {
         console.log(
             `Funding buyer with ${amount - buyerBalance} wei USDT from DEPLOYER...`,
@@ -235,6 +252,7 @@ async function testDirectCreateEscrow() {
 
     const amount = 10n * 1_000_000n;
     const buyer = buyerWalletClient.account.address;
+    const seller = sellerWalletClient.account.address;
     const arbiter = arbiterWalletClient.account.address;
 
     console.log('Direct call params:', {
@@ -425,8 +443,6 @@ async function testUnauthorizedActions() {
     const escrowId = await createEscrow(7n);
     await testDepositEscrow(escrowId);
     await sdk.startDispute(buyerWalletClient, escrowId);
-
-    // ✅ FIX: Submit evidence so test fails on authorization, not evidence requirement
     await sdk.submitDisputeMessage(
         buyerWalletClient,
         escrowId,
@@ -451,7 +467,6 @@ async function testUnauthorizedActions() {
         );
     } catch (err: any) {
         failed = true;
-        // ✅ NEW: Log error details
         if (err instanceof SDKError) {
             console.log('Error code:', err.code);
             console.log('Error details:', err.details);
@@ -514,7 +529,6 @@ async function testDoubleActions() {
     }
     console.assert(failed, 'Second startDispute should revert');
 
-    // ✅ FIX: Submit evidence before arbiter decision
     await sdk.submitDisputeMessage(
         buyerWalletClient,
         escrowId,
@@ -643,7 +657,6 @@ async function testEdgeParameters() {
     console.log('\n✅ TEST 7 PASSED: Edge parameters\n');
 }
 
-// Test: deposit called by non-buyer should throw NOT_BUYER
 async function testDepositNotBuyerError() {
     console.log('\n🧪 ERROR 1: deposit NOT_BUYER\n');
 
@@ -664,7 +677,6 @@ async function testDepositNotBuyerError() {
     console.log('✅ deposit NOT_BUYER error mapped correctly');
 }
 
-// Test: deposit with insufficient balance should throw INSUFFICIENT_BALANCE
 async function testDepositInsufficientBalance() {
     console.log('\n🧪 ERROR 2: deposit INSUFFICIENT_BALANCE\n');
 
@@ -687,7 +699,6 @@ async function testDepositInsufficientBalance() {
     console.log('✅ deposit INSUFFICIENT_BALANCE error mapped correctly');
 }
 
-// Test: allowance verification failure should throw ALLOWANCE_FAILED
 async function testDepositAllowanceFailed() {
     console.log('\n🧪 ERROR 3: deposit ALLOWANCE_FAILED\n');
 
@@ -732,7 +743,42 @@ async function testDepositAllowanceFailed() {
     console.log('✅ deposit ALLOWANCE_FAILED error mapped correctly');
 }
 
-// Test: buyer-only confirmDelivery + withdraw in COMPLETE state
+
+async function testCreateEscrowAndDeposit() {
+    console.log('\n🧪 FLOW: confirmDelivery + withdraw\n');
+
+    const escrowId = await createEscrowAndDeposit(7n);
+    await testDepositEscrow(escrowId);
+
+    // buyer confirms delivery
+    const confirmTx = await sdk.confirmDelivery(buyerWalletClient, escrowId);
+    console.log('confirmDelivery tx:', confirmTx);
+    await publicClient.waitForTransactionReceipt({ hash: confirmTx });
+
+    let status = await sdk.getEscrowStatus(escrowId);
+    console.log('State after confirmDelivery:', status.stateName);
+
+    // withdraw should work now (buyer or seller depending on your contract)
+    const withdrawTx = await sdk.withdraw(sellerWalletClient, escrowId);
+    console.log('withdraw tx:', withdrawTx);
+    await publicClient.waitForTransactionReceipt({ hash: withdrawTx });
+
+    // withdraw in non-ended state should fail
+    const escrowId2 = await createEscrow(7n);
+    let caught: any;
+    try {
+        await sdk.withdraw(buyerWalletClient, escrowId2);
+    } catch (e: any) {
+        caught = e;
+    }
+    console.assert(
+        caught instanceof SDKError &&
+        caught.code === SDKErrorCode.INVALID_STATE,
+        `Expected INVALID_STATE on early withdraw, got ${caught?.code}`,
+    );
+
+    console.log('✅ confirmDelivery + withdraw behavior correct');
+}
 async function testConfirmDeliveryAndWithdraw() {
     console.log('\n🧪 FLOW: confirmDelivery + withdraw\n');
 
@@ -769,7 +815,6 @@ async function testConfirmDeliveryAndWithdraw() {
     console.log('✅ confirmDelivery + withdraw behavior correct');
 }
 
-// Test: cache eviction after state change
 async function testCacheEviction() {
     console.log('\n🧪 CACHE: eviction after state change\n');
 
@@ -780,7 +825,6 @@ async function testCacheEviction() {
 
     await testDepositEscrow(escrowId);
 
-    // ✅ Cache is automatically cleared after deposit in optimized SDK
     let status2 = await sdk.getEscrowStatus(escrowId, false);
     console.log('State after deposit (cached=false):', status2.stateName);
 
@@ -788,15 +832,11 @@ async function testCacheEviction() {
         status2.stateName === 'AWAITING_DELIVERY',
         'Cache should have been evicted/updated after deposit',
     );
-
-    // ✅ Use EscrowState enum instead of SDKErrorCode
     const inAwaitingDelivery = await sdk.isInState(
         escrowId,
         EscrowState.AWAITING_DELIVERY
     );
     console.log('isInState(AWAITING_DELIVERY):', inAwaitingDelivery);
-
-    // ✅ NEW: Check cache stats
     const stats = sdk.getCacheStats();
     console.log('Cache stats after operations:', stats);
 }
@@ -821,7 +861,6 @@ async function testConfirmDeliverySigned() {
     }
 }
 
-// ✅ NEW TEST: Health check
 async function testHealthCheck() {
     console.log('\n🧪 TEST: SDK Health Check\n');
 
@@ -843,7 +882,6 @@ async function testHealthCheck() {
     console.log('✅ Health check passed\n');
 }
 
-// ✅ NEW TEST: Batch operations
 async function testBatchOperations() {
     console.log('\n🧪 TEST: Batch Operations\n');
 
@@ -856,7 +894,6 @@ async function testBatchOperations() {
 
     console.log('Created escrows:', escrowIds.map(id => id.toString()));
 
-    // Fetch all in batch
     const results = await sdk.getEscrowsBatch(escrowIds);
 
     const successful = results.filter(r => r.success);
@@ -870,7 +907,6 @@ async function testBatchOperations() {
     console.log('✅ Batch operations test passed\n');
 }
 
-// ✅ NEW TEST: Simulation
 async function testTransactionSimulation() {
     console.log('\n🧪 TEST: Transaction Simulation\n');
 
@@ -902,7 +938,6 @@ async function testTransactionSimulation() {
 
 // ========== ADDITIONAL COMPREHENSIVE TESTS ==========
 
-// Test: cancelByTimeout
 async function testCancelByTimeout() {
     console.log('\n🧪 TEST: cancelByTimeout (Time-based buyer protection)\n');
 
@@ -922,7 +957,6 @@ async function testCancelByTimeout() {
         'Should still be AWAITING_DELIVERY after single request'
     );
 
-    // Try to cancel immediately (should fail - grace period not reached)
     let failed = false;
     try {
         await sdk.cancelByTimeout(buyerWalletClient, escrowId);
@@ -958,7 +992,6 @@ async function testCancelByTimeout() {
     console.log('\n✅ TEST PASSED: cancelByTimeout\n');
 }
 
-// Test: Query methods (nonces, withdrawable, fee pool)
 async function testQueryMethods() {
     console.log('\n🧪 TEST: Query Methods (nonces, withdrawable, feePool)\n');
 
@@ -1005,7 +1038,6 @@ async function testQueryMethods() {
     console.log('\n✅ TEST PASSED: Query Methods\n');
 }
 
-// Test: confirmDeliverySigned - Comprehensive
 async function testConfirmDeliverySignedComprehensive() {
     console.log('\n🧪 TEST: confirmDeliverySigned (Comprehensive)\n');
 
@@ -1053,7 +1085,6 @@ async function testConfirmDeliverySignedComprehensive() {
     console.log('\n✅ TEST PASSED: confirmDeliverySigned Comprehensive\n');
 }
 
-// Test: requestCancelSigned
 async function testRequestCancelSigned() {
     console.log('\n🧪 TEST: requestCancelSigned\n');
 
@@ -1096,7 +1127,6 @@ async function testRequestCancelSigned() {
     console.log('\n✅ TEST PASSED: requestCancelSigned\n');
 }
 
-// Test: startDisputeSigned
 async function testStartDisputeSigned() {
     console.log('\n🧪 TEST: startDisputeSigned\n');
 
@@ -1126,15 +1156,11 @@ async function testStartDisputeSigned() {
     console.log('\n✅ TEST PASSED: startDisputeSigned\n');
 }
 
-// Test: Admin Methods (setAllowedToken, withdrawFees)
 async function testAdminMethods() {
     console.log('\n🧪 TEST: Admin Methods (setAllowedToken, withdrawFees)\n');
 
-    // Note: These require owner privileges
-    // For this integrated test, we'll use deployer as owner
     const ownerWalletClient = deployerWalletClient;
 
-    // Test getFeePool
     const feePoolBefore = await sdk.getFeePool(USDT);
     console.log('Fee pool before:', feePoolBefore.toString());
 
@@ -1158,7 +1184,6 @@ async function testAdminMethods() {
     console.log('\n✅ TEST PASSED: Admin Methods\n');
 }
 
-// Test: Withdraw in REFUNDED state
 async function testWithdrawRefunded() {
     console.log('\n🧪 TEST: Withdraw in REFUNDED State\n');
 
@@ -1236,7 +1261,6 @@ async function testWithdrawRefunded() {
     console.log('\n✅ TEST PASSED: Withdraw in REFUNDED State\n');
 }
 
-// Test: 7-day dispute timeout (partial evidence)
 async function testDispute7DayTimeout() {
     console.log('\n🧪 TEST: 7-Day Dispute Timeout (Partial Evidence)\n');
 
@@ -1275,8 +1299,6 @@ async function testDispute7DayTimeout() {
     const SEVEN_DAYS = 7 * 24 * 60 * 60;
     await advanceTime(SEVEN_DAYS + 60); // +1 minute buffer
     console.log('⏰ Advanced time 7 days');
-
-    // Now arbiter decision should work
     await sdk.submitArbiterDecision(
         arbiterWalletClient,
         escrowId,
@@ -1292,7 +1314,6 @@ async function testDispute7DayTimeout() {
     console.log('\n✅ TEST PASSED: 7-Day Dispute Timeout\n');
 }
 
-// Test: 30-day dispute timeout (no evidence)
 async function testDispute30DayTimeout() {
     console.log('\n🧪 TEST: 30-Day Dispute Timeout (No Evidence)\n');
 
@@ -1305,8 +1326,6 @@ async function testDispute30DayTimeout() {
 
     // No evidence submitted by anyone
     console.log('ℹ️  No evidence submitted');
-
-    // Try immediate arbiter decision (should fail)
     let failed = false;
     try {
         await sdk.submitArbiterDecision(
@@ -1326,7 +1345,6 @@ async function testDispute30DayTimeout() {
     await advanceTime(THIRTY_DAYS_PLUS_BUFFER + 60); // +1 minute extra
     console.log('⏰ Advanced time 30 days + buffer');
 
-    // Now arbiter decision should work without any evidence
     await sdk.submitArbiterDecision(
         arbiterWalletClient,
         escrowId,
@@ -1335,7 +1353,6 @@ async function testDispute30DayTimeout() {
     );
     console.log('✅ Arbiter decision succeeded after 30-day timeout (no evidence)');
 
-    // Verify state
     const status = await sdk.getEscrowStatus(escrowId);
     console.assert(status.stateName === 'REFUNDED', 'Should be REFUNDED');
 
@@ -1343,12 +1360,9 @@ async function testDispute30DayTimeout() {
 }
 
 // ========== MAIN RUNNER ==========
-
 async function run() {
     try {
         console.log('=== SDK OPTIMIZED TESTS START ===\n');
-
-        // ✅ NEW: Health check first
         await testHealthCheck();
 
         logUsdtBalances();
@@ -1369,13 +1383,9 @@ async function run() {
         await testCacheEviction();
 
         await testConfirmDeliverySigned();
-
-        // ✅ NEW: Test new features
         await testBatchOperations();
         await testTransactionSimulation();
 
-        // ✅ ADDITIONAL: Comprehensive coverage tests
-        console.log('\n=== ADDITIONAL COMPREHENSIVE TESTS ===\n');
         await testCancelByTimeout();
         await testQueryMethods();
         await testConfirmDeliverySignedComprehensive();
@@ -1389,8 +1399,6 @@ async function run() {
         console.log('\n====================================');
         console.log('✅ ALL TESTS PASSED (24 TOTAL)');
         console.log('====================================\n');
-
-        // ✅ NEW: Final cache stats
         const finalStats = sdk.getCacheStats();
         console.log('Final cache stats:', finalStats);
 
