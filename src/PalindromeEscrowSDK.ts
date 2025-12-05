@@ -1105,7 +1105,7 @@ export class PalindromeEscrowSDK {
     return {
       name: 'PalindromeCryptoEscrow',
       version: '1',
-      chainId: this.chain.id,          // or await publicClient.getChainId()
+      chainId: this.chain.id,
       verifyingContract: this.contractAddress,
     } as const;
   }
@@ -1173,7 +1173,6 @@ export class PalindromeEscrowSDK {
 
   /**
    * EIP-712 types for ConfirmDelivery.
-   * Must match CONFIRM_DELIVERY_TYPEHASH in the contract.
    */
   private readonly confirmDeliveryTypes = {
     ConfirmDelivery: [
