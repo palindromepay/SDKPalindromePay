@@ -7,6 +7,7 @@
  *   - Full SDK workflow: createEscrow, deposit, startDispute, evidence submission,
  *     and submitArbiterDecision for both COMPLETE (seller wins) and REFUNDED (buyer wins).
  *   - Buyer confirmDelivery and correct withdraw caller in COMPLETE state.
+ *   - Seller withdraw All Token
  *
  * - Permissions & Invalid flows:
  *   - Unauthorized submitArbiterDecision attempt by buyer.
@@ -815,6 +816,64 @@ async function testConfirmDeliveryAndWithdraw() {
     console.log('✅ confirmDelivery + withdraw behavior correct');
 }
 
+async function testWithdrawAll() {
+    console.log('\n🧪 TEST: withdrawAll aggregated balance\n');
+
+    // 1. Create + deposit + confirm so seller has withdrawable USDT
+    const escrowId = await createEscrow(14n);
+    await testDepositEscrow(escrowId);
+
+    // Buyer confirms delivery (seller gets payout with fee)
+    const confirmTx = await sdk.confirmDelivery(buyerWalletClient, escrowId);
+    await publicClient.waitForTransactionReceipt({ hash: confirmTx });
+    console.log('✅ Delivery confirmed');
+
+    // 2. Check seller withdrawable and aggregated balance
+    const seller = sellerWalletClient.account.address;
+
+    const withdrawables = await sdk.getWithdrawableAmounts(escrowId);
+    console.log('Seller withdrawable (per-escrow):', withdrawables.seller.toString());
+    console.assert(withdrawables.seller > 0n, 'Seller should have withdrawable amount');
+
+    const aggregatedBefore = await sdk.publicClient.readContract({
+        address: contractAddress,
+        abi: sdk.abiEscrow,
+        functionName: 'aggregatedBalance',
+        args: [USDT, seller],
+    }) as bigint;
+
+    console.log('Seller aggregated balance before:', aggregatedBefore.toString());
+    console.assert(aggregatedBefore > 0n, 'Aggregated balance should be > 0');
+
+    const sellerBalanceBefore = await sdk.getUSDTBalanceOf(seller, USDT);
+    console.log('Seller USDT before withdrawAll:', sellerBalanceBefore.toString());
+
+    // 3. Call withdrawAllToken (the helper you just added)
+    const txHash = await sdk.withdrawAllToken(sellerWalletClient, USDT);
+    await publicClient.waitForTransactionReceipt({ hash: txHash });
+    console.log('✅ withdrawAll executed:', txHash);
+
+    // 4. Verify on-chain effects
+    const sellerBalanceAfter = await sdk.getUSDTBalanceOf(seller, USDT);
+    console.log('Seller USDT after withdrawAll:', sellerBalanceAfter.toString());
+    console.assert(
+        sellerBalanceAfter === sellerBalanceBefore + aggregatedBefore,
+        'Seller should receive full aggregated balance'
+    );
+
+    const aggregatedAfter = await sdk.publicClient.readContract({
+        address: contractAddress,
+        abi: sdk.abiEscrow,
+        functionName: 'aggregatedBalance',
+        args: [USDT, seller],
+    }) as bigint;
+
+    console.log('Seller aggregated balance after:', aggregatedAfter.toString());
+    console.assert(aggregatedAfter === 0n, 'Aggregated balance should be zero after withdrawAll');
+
+    console.log('\n✅ TEST PASSED: withdrawAll aggregated balance\n');
+}
+
 async function testCacheEviction() {
     console.log('\n🧪 CACHE: eviction after state change\n');
 
@@ -1380,6 +1439,7 @@ async function run() {
         await testDepositInsufficientBalance();
         await testDepositAllowanceFailed();
         await testConfirmDeliveryAndWithdraw();
+        await testWithdrawAll();
         await testCacheEviction();
 
         await testConfirmDeliverySigned();

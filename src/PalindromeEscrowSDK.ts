@@ -1882,7 +1882,7 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Withdraw funds
+   * Withdraw funds for ecrowId
    */
   async withdraw(walletClient: WalletClient, escrowId: bigint): Promise<Hex> {
     assertWalletClient(walletClient);
@@ -1911,6 +1911,36 @@ export class PalindromeEscrowSDK {
       );
     }
   }
+
+  /**
+   * Withdraw full aggregated balance for a specific ERC20 token.
+   * Wraps contract withdrawAll(address token).
+   */
+  async withdrawAllToken(
+    walletClient: WalletClient,
+    token: Address
+  ): Promise<Hex> {
+    assertWalletClient(walletClient);
+    this.validateAddress(token, 'token');
+
+    try {
+      const txHash = await this.sendAndConfirm(
+        walletClient,
+        'withdrawAll',
+        [token]
+      );
+      this.clearCache(undefined, `aggregated:${token.toLowerCase()}`);
+      return txHash;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new SDKError(
+        `withdrawAll transaction failed: ${errorMessage}`,
+        SDKErrorCode.TRANSACTION_FAILED
+      );
+    }
+  }
+
+
 
   // ==========================================================================
   // CANCELLATION METHODS
