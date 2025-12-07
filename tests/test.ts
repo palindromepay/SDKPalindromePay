@@ -117,7 +117,7 @@ async function fundBuyer(amount: bigint = 100n * ONE_USDT) {
     if (bal >= amount) return;
     await deployerWalletClient.writeContract({
         address: USDT,
-        abi: sdk.abiUSDT,
+        abi: sdk.abiERC20,
         functionName: "transfer",
         args: [buyer, amount - bal],
     });
@@ -239,7 +239,7 @@ async function testDepositEscrow(escrowId: bigint) {
         );
         await deployerWalletClient.writeContract({
             address: USDT,
-            abi: sdk.abiUSDT,
+            abi: sdk.abiERC20,
             functionName: "transfer",
             args: [buyer, amount - buyerBalance],
         });
@@ -386,7 +386,7 @@ async function testHappyPathFullFlow() {
         netAmount,
         feeTo,
         feeAmount,
-        walletNonce         // use walletNonce here
+        walletNonce
     );
     const buyerSig = await signWalletHash(buyerWalletClient, txHashWallet);
     const sellerSig = await signWalletHash(sellerWalletClient, txHashWallet);
@@ -1313,7 +1313,6 @@ async function run() {
     await testHealthCheck();
     await testConfirmDeliverySigned();
     await testHappyPathFullFlow();
-    await testExecuteEscrowERC20Split();
     await testExecuteEscrowERC20Split();
     await testConfirmDeliverySignedWrongSigner();
     await testConfirmDeliverySignedExpiredDeadline();

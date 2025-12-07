@@ -10,11 +10,13 @@ import {
   encodeFunctionData,
   decodeAbiParameters,
   parseEventLogs,
+  Transport,
+  Account,
 } from "viem";
 import { readContract } from "viem/actions";
 import PalindromeCryptoEscrowABI from "./contract/PalindromeCryptoEscrow.json";
 import PalindromeEscrowWalletABI from "./contract/PalindromeEscrowWallet.json";
-import USDTABI from "./contract/USDT.json";
+import ERC20ABI from "./contract/USDT.json";
 import { ApolloClient, InMemoryCache, HttpLink } from "@apollo/client";
 import {
   ALL_ESCROWS_QUERY,
@@ -26,6 +28,12 @@ import {
 import { Escrow } from "./types/escrow";
 import { Chain, hardhat } from "viem/chains";
 import { PalindromeEscrowWalletClient, signWalletHash } from "./PalindromeEscrowWalletClient";
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+const MAX_NONCE_BUCKETS = 16n; // supports first 4096 nonces
+
 
 // ============================================================================
 // ENUMS & TYPES
@@ -73,6 +81,12 @@ export enum SDKErrorCode {
   RPC_ERROR = "RPC_ERROR",
 }
 
+export type EscrowWalletClient = WalletClient<
+  Transport,
+  Chain,
+  Account
+>;
+
 export interface EventWatcher {
   dispose: () => void;
 }
@@ -116,10 +130,23 @@ export class SignatureDeadlineExpiredError extends SDKError {
   }
 }
 
+export type CachePolicy = "default" | "no-cache" | "aggressive";
+
+interface CacheEntry<T> {
+  data: T;
+  timestamp: number;
+  ttl: number;
+}
+
+const CACHE_KEYS = {
+  allEscrows: "all-escrows",
+  escrow: (id: bigint | string) => `escrow:${id.toString()}`,
+} as const;
+
 export interface PalindromeEscrowSDKConfig {
   publicClient: PublicClient;
-  contractAddress?: Address;
-  walletClient?: WalletClient;
+  contractAddress: Address;
+  walletClient?: EscrowWalletClient;
   apolloClient?: ApolloClient;
   chain?: Chain;
   /** Cache TTL in milliseconds (default: 5000) */
@@ -134,6 +161,7 @@ export interface PalindromeEscrowSDKConfig {
   subgraphUrl?: string;
   /** Default ERC20 token used for checks (e.g. USDT) */
   defaultToken?: Address;
+  cachePolicy?: CachePolicy;
 }
 
 export interface CreateEscrowParams {
@@ -218,12 +246,6 @@ export interface GasPriceStrategy {
   gasPrice?: bigint;
 }
 
-interface CacheEntry<T> {
-  data: T;
-  timestamp: number;
-  ttl: number;
-}
-
 interface RetryConfig {
   maxAttempts: number;
   delayMs: number;
@@ -235,8 +257,8 @@ interface RetryConfig {
 // ============================================================================
 
 function assertWalletClient(
-  client: WalletClient | undefined
-): asserts client is WalletClient & { account: NonNullable<WalletClient["account"]> } {
+  client: EscrowWalletClient | undefined
+): asserts client is EscrowWalletClient {
   if (!client) throw new WalletClientRequiredError();
   if (!client.account) throw new WalletAccountRequiredError();
 }
@@ -305,9 +327,9 @@ export class PalindromeEscrowSDK {
   contractAddress: Address;
   abiEscrow: Abi;
   abiEscrowWallet: Abi;
-  abiUSDT: Abi;
+  abiERC20: Abi;
   publicClient: PublicClient;
-  walletClient?: WalletClient;
+  walletClient?: EscrowWalletClient;
   apollo: ApolloClient;
   chain: Chain;
 
@@ -325,23 +347,29 @@ export class PalindromeEscrowSDK {
   private readonly retryConfig: RetryConfig;
   private readonly gasBuffer: number;
   private readonly defaultToken?: Address;
-
+  private readonly cachePolicy: CachePolicy;
   private escrowCache: Map<string, CacheEntry<any>> = new Map();
   private tokenDecimalsCache: Map<Address, number> = new Map();
 
   constructor(config: PalindromeEscrowSDKConfig) {
-    this.contractAddress = (config.contractAddress ??
-      ("0x40187460635158a20b6c3ec670eb17b4aac1356d" as Address)) as Address;
+    if (!config.contractAddress) {
+      throw new SDKError(
+        "contractAddress is required in PalindromeEscrowSDKConfig",
+        SDKErrorCode.VALIDATION_ERROR
+      );
+    }
+    this.contractAddress = config.contractAddress as Address;
     this.abiEscrow = PalindromeCryptoEscrowABI.abi as Abi;
     this.abiEscrowWallet = PalindromeEscrowWalletABI.abi as Abi;
-    this.abiUSDT = USDTABI.abi as Abi;
+    this.abiERC20 = ERC20ABI.abi as Abi;
     this.publicClient = config.publicClient;
-    this.walletClient = config.walletClient;
+    this.walletClient = config.walletClient as EscrowWalletClient;
     this.chain = config.chain ?? hardhat;
     this.cacheTTL = config.cacheTTL ?? 5000;
     this.enableRetry = config.enableRetry ?? true;
     this.defaultToken = config.defaultToken;
     this.gasBuffer = config.gasBuffer ?? 20;
+    this.cachePolicy = config.cachePolicy ?? "default";
     this.retryConfig = {
       maxAttempts: config.maxRetries ?? 3,
       delayMs: 1000,
@@ -358,6 +386,30 @@ export class PalindromeEscrowSDK {
         }),
         cache: new InMemoryCache(),
       });
+
+    if (this.walletClient) {
+      assertWalletClient(this.walletClient);
+      const walletChainId = (this.walletClient as any).chain?.id;
+      if (walletChainId != null && walletChainId !== this.chain.id) {
+        throw new SDKError(
+          `Wallet chainId ${walletChainId} does not match SDK chainId ${this.chain.id}`,
+          SDKErrorCode.VALIDATION_ERROR
+        );
+      }
+      const account: any = this.getConnectedAccountOrThrow(this.walletClient);
+      const addr =
+        typeof account === "string"
+          ? account
+          : typeof account === "object"
+            ? account.address
+            : undefined;
+      if (!addr || !addr.startsWith("0x")) {
+        throw new SDKError(
+          "Unsupported walletClient.account shape. Expected 0x-prefixed address.",
+          SDKErrorCode.WALLET_ACCOUNT_MISSING
+        );
+      }
+    }
   }
 
   // ==========================================================================
@@ -409,6 +461,7 @@ export class PalindromeEscrowSDK {
   }
 
   private setCache<T>(key: string, data: T, ttl?: number): void {
+    if (this.cachePolicy === "no-cache") return;
     this.escrowCache.set(key, {
       data,
       timestamp: Date.now(),
@@ -418,10 +471,11 @@ export class PalindromeEscrowSDK {
 
   private clearCache(escrowId?: bigint, pattern?: string): void {
     if (escrowId !== undefined) {
-      const key = `escrow:${escrowId.toString()}`;
+      const key = CACHE_KEYS.escrow(escrowId);
       this.escrowCache.delete(key);
       return;
     }
+
     if (pattern) {
       for (const key of this.escrowCache.keys()) {
         if (key.includes(pattern)) {
@@ -430,8 +484,10 @@ export class PalindromeEscrowSDK {
       }
       return;
     }
+
     this.escrowCache.clear();
   }
+
 
   public clearAllCaches(): void {
     this.escrowCache.clear();
@@ -468,7 +524,7 @@ export class PalindromeEscrowSDK {
    * Sender must be buyer or seller (enforced by contract).
    */
   async cancelByTimeout(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
   ): Promise<Hex> {
     // Contract function: cancelByTimeout(uint256 escrowId)
@@ -518,8 +574,8 @@ export class PalindromeEscrowSDK {
     escrowId: bigint,
     forceRefresh = false
   ): Promise<any> {
-    const key = `escrow:${escrowId.toString()}`;
-    if (!forceRefresh) {
+    const key = CACHE_KEYS.escrow(escrowId);
+    if (!forceRefresh && this.cachePolicy !== "no-cache") {
       const cached = this.getCached<any>(key);
       if (cached) return cached;
     }
@@ -527,6 +583,7 @@ export class PalindromeEscrowSDK {
     this.setCache(key, data);
     return data;
   }
+
 
   private parseEscrowData(escrow: any): EscrowData {
     return {
@@ -626,12 +683,9 @@ export class PalindromeEscrowSDK {
 
   /**
  * Read a per-signer nonce from the bitmap by scanning buckets.
- * This reproduces the old SDK getUserNonce helper.
  */
   async getUserNonce(escrowId: bigint, signer: Address): Promise<bigint> {
-    // Each bucket holds 256 nonces
-    const maxBuckets = 16n; // supports first 4096 nonces, adjust if ever needed
-    for (let bucket = 0n; bucket < maxBuckets; bucket++) {
+    for (let bucket = 0n; bucket < MAX_NONCE_BUCKETS; bucket++) {
       const bitmap = (await this.publicClient.readContract({
         address: this.contractAddress,
         abi: this.abiEscrow,
@@ -640,11 +694,9 @@ export class PalindromeEscrowSDK {
       })) as bigint;
 
       if (bitmap === 0n) {
-        // first free nonce is at start of this bucket
         return bucket * 256n;
       }
 
-      // find first zero bit in this bucket
       for (let bit = 0n; bit < 256n; bit++) {
         const mask = 1n << bit;
         if ((bitmap & mask) === 0n) {
@@ -654,10 +706,11 @@ export class PalindromeEscrowSDK {
     }
 
     throw new SDKError(
-      `No free nonce found in first ${maxBuckets * 256n} slots`,
+      `No free nonce found in first ${MAX_NONCE_BUCKETS * 256n} slots. Consider creating a new escrow.`,
       SDKErrorCode.INVALID_STATE
     );
   }
+
 
 
   // ==========================================================================
@@ -665,19 +718,31 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   async getEscrows(useCache = true): Promise<Escrow[]> {
-    const key = "all-escrows";
-    if (useCache) {
+    const key = CACHE_KEYS.allEscrows;
+
+    const shouldUseCache =
+      useCache && this.cachePolicy !== "no-cache";
+
+    if (shouldUseCache) {
       const cached = this.getCached<Escrow[]>(key);
       if (cached) return cached;
     }
+
+    const fetchPolicy =
+      this.cachePolicy === "aggressive" && useCache
+        ? "cache-first"
+        : "network-only";
+
     const { data } = await this.apollo.query<{ escrows: Escrow[] }>({
       query: ALL_ESCROWS_QUERY,
-      fetchPolicy: useCache ? "cache-first" : "network-only",
+      fetchPolicy,
     });
+
     const escrows = data?.escrows ?? [];
     this.setCache(key, escrows, 10000);
     return escrows;
   }
+
 
   async getEscrowsByBuyer(buyer: string): Promise<Escrow[]> {
     this.validateAddress(buyer, "buyer");
@@ -722,69 +787,145 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
   // TOKEN UTILITIES
   // ==========================================================================
-
   async getTokenDecimals(tokenAddress: Address): Promise<number> {
     if (this.tokenDecimalsCache.has(tokenAddress)) {
       return this.tokenDecimalsCache.get(tokenAddress)!;
     }
 
-    const decimalsData = encodeFunctionData({
-      abi: this.abiUSDT,
+    const data = encodeFunctionData({
+      abi: this.abiERC20,
       functionName: "decimals",
     });
 
-    const decimalsResult = await this.executeWithRetry(() =>
-      this.publicClient.call({
-        to: tokenAddress,
-        data: decimalsData,
-      })
+    const result = await this.executeWithRetry(() =>
+      this.publicClient.call({ to: tokenAddress, data })
     );
 
-    const [decimals] = decodeAbiParameters(
-      [{ type: "uint8" }],
-      decimalsResult.data as Hex
-    );
-    const decimalsNum = Number(decimals);
-    this.tokenDecimalsCache.set(tokenAddress, decimalsNum);
-    return decimalsNum;
+    if (!result?.data || result.data === "0x") {
+      throw new SDKError(
+        "Decimals call failed: token may be non-standard or returned no data",
+        SDKErrorCode.INVALIDTOKEN,
+        { tokenAddress }
+      );
+    }
+
+    const [decimals] = decodeAbiParameters([{ type: "uint8" }], result.data as Hex);
+    const n = Number(decimals);
+
+    if (!Number.isFinite(n) || n < 0 || n > 36) {
+      throw new SDKError(
+        `Token decimals out of expected range: ${n}`,
+        SDKErrorCode.INVALIDTOKEN,
+        { tokenAddress }
+      );
+    }
+
+    this.tokenDecimalsCache.set(tokenAddress, n);
+    return n;
   }
 
   async getTokenBalanceOf(
     account: Address,
     tokenAddress: Address
   ): Promise<bigint> {
-    const balanceData = encodeFunctionData({
-      abi: this.abiUSDT,
+    const data = encodeFunctionData({
+      abi: this.abiERC20,
       functionName: "balanceOf",
       args: [account],
     });
 
-    const balanceResult = await this.executeWithRetry(() =>
-      this.publicClient.call({
-        to: tokenAddress,
-        data: balanceData,
-      })
+    const result = await this.executeWithRetry(() =>
+      this.publicClient.call({ to: tokenAddress, data })
     );
 
-    if (!balanceResult?.data || balanceResult.data === "0x") {
+    if (!result?.data || result.data === "0x") {
       throw new SDKError(
-        "Balance call failed: No valid data returned",
-        SDKErrorCode.TRANSACTION_FAILED
+        "Balance call failed: token may be non-standard or returned no data",
+        SDKErrorCode.TRANSACTION_FAILED,
+        { tokenAddress }
       );
     }
 
-    const [balance] = decodeAbiParameters(
-      [{ type: "uint256" }],
-      balanceResult.data as Hex
-    );
+    const [balance] = decodeAbiParameters([{ type: "uint256" }], result.data as Hex);
     return BigInt(balance);
   }
+
 
   formatTokenAmount(amount: bigint, decimals: number): string {
     const divisor = 10n ** BigInt(decimals);
     const integerPart = amount / divisor;
     const fractionalStr = (amount % divisor).toString().padStart(decimals, "0");
     return `${integerPart.toString()}.${fractionalStr}`;
+  }
+
+  async getTokenAllowance(
+    owner: Address,
+    spender: Address,
+    tokenAddress: Address
+  ): Promise<bigint> {
+    const data = encodeFunctionData({
+      abi: this.abiERC20,
+      functionName: "allowance",
+      args: [owner, spender],
+    });
+
+    const result = await this.executeWithRetry(() =>
+      this.publicClient.call({ to: tokenAddress, data })
+    );
+
+    if (!result?.data || result.data === "0x") {
+      throw new SDKError(
+        "Allowance call failed: token may be non-standard or returned no data",
+        SDKErrorCode.ALLOWANCE_FAILED,
+        { tokenAddress }
+      );
+    }
+
+    const [allowance] = decodeAbiParameters([{ type: "uint256" }], result.data as Hex);
+    return BigInt(allowance);
+  }
+
+  private async ensureAllowance(
+    walletClient: EscrowWalletClient,
+    token: Address,
+    owner: Address,
+    spender: Address,
+    required: bigint
+  ): Promise<void> {
+    assertWalletClient(walletClient);
+
+    const current = await this.getTokenAllowance(owner, spender, token);
+    if (current >= required) return;
+
+    const data = encodeFunctionData({
+      abi: this.abiERC20,
+      functionName: "approve",
+      args: [spender, required],
+    });
+
+    const gas = await this.publicClient.estimateGas({
+      to: token,
+      account: owner,
+      data,
+    });
+
+    const hash = await walletClient.sendTransaction({
+      to: token,
+      data,
+      gas,
+      chain: this.chain,
+      account: walletClient.account,
+    });
+
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+
+    if (receipt.status !== "success") {
+      throw new SDKError(
+        "Approve transaction failed on-chain",
+        SDKErrorCode.ALLOWANCE_FAILED,
+        { txHash: hash, receipt }
+      );
+    }
   }
 
   // ==========================================================================
@@ -912,8 +1053,8 @@ export class PalindromeEscrowSDK {
     return BigInt(now + minutesFromNow * 60);
   }
 
-  isSignatureDeadlineExpired(deadline: bigint): boolean {
-    const now = Math.floor(Date.now() / 1000);
+  isSignatureDeadlineExpired(deadline: bigint, safetySeconds = 5): boolean {
+    const now = Math.floor(Date.now() / 1000) + safetySeconds;
     return BigInt(now) > deadline;
   }
 
@@ -1002,7 +1143,7 @@ export class PalindromeEscrowSDK {
   }
 
   async signConfirmDelivery(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
     deadline: bigint,
     nonce: bigint
@@ -1025,7 +1166,7 @@ export class PalindromeEscrowSDK {
   }
 
   async signStartDispute(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
     deadline: bigint,
     nonce: bigint
@@ -1048,7 +1189,7 @@ export class PalindromeEscrowSDK {
   }
 
   async signRequestCancel(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
     deadline: bigint,
     nonce: bigint
@@ -1139,7 +1280,7 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   private async sendAndConfirm(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     functionName: string,
     args: any[]
   ): Promise<Hex> {
@@ -1148,7 +1289,7 @@ export class PalindromeEscrowSDK {
     const escrowId = args[0] as bigint | undefined;
     if (escrowId !== undefined) this.clearCache(escrowId);
 
-    const account = walletClient.account.address;
+    const account = this.getConnectedAccountOrThrow(walletClient);
 
     await this.publicClient
       .simulateContract({
@@ -1206,18 +1347,21 @@ export class PalindromeEscrowSDK {
   }
 
   async simulateTransaction(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     functionName: string,
     args: any[]
   ): Promise<SimulationResult> {
     assertWalletClient(walletClient);
+
+    const account = this.getConnectedAccountOrThrow(walletClient);
+
     try {
       await this.publicClient.simulateContract({
         address: this.contractAddress,
         abi: this.abiEscrow,
         functionName,
         args,
-        account: walletClient.account.address,
+        account
       });
 
       const gasEstimate = await this.publicClient.estimateContractGas({
@@ -1225,7 +1369,7 @@ export class PalindromeEscrowSDK {
         abi: this.abiEscrow,
         functionName,
         args,
-        account: walletClient.account.address,
+        account
       });
 
       return { success: true, gasEstimate };
@@ -1238,19 +1382,36 @@ export class PalindromeEscrowSDK {
     }
   }
 
-  private getAccountAddress(walletClient: WalletClient): Address | null {
+  private getConnectedAccountOrThrow(
+    walletClient?: EscrowWalletClient
+  ): Address {
+    assertWalletClient(walletClient);
     const account: any = walletClient.account;
-    if (!account) return null;
-    if (typeof account === "object" && typeof account.address === "string") {
-      const addr = account.address as string;
-      return addr.startsWith("0x") ? (addr as Address) : null;
+    const addr =
+      typeof account === "string"
+        ? account
+        : typeof account === "object"
+          ? account.address
+          : undefined;
+
+    if (!addr || !addr.startsWith("0x")) {
+      throw new WalletAccountRequiredError();
     }
-    if (typeof account === "string") {
-      const addr = account as string;
-      return addr.startsWith("0x") ? (addr as Address) : null;
-    }
-    return null;
+
+    return addr as Address;
   }
+
+  private getUserRoleForEscrow(
+    user: Address,
+    escrow: EscrowData
+  ): Role {
+    const u = user.toLowerCase();
+    if (u === escrow.buyer.toLowerCase()) return Role.Buyer;
+    if (u === escrow.seller.toLowerCase()) return Role.Seller;
+    if (u === escrow.arbiter.toLowerCase()) return Role.Arbiter;
+    return Role.None;
+  }
+
 
   // ==========================================================================
   // CORE ESCROW ACTIONS
@@ -1307,7 +1468,7 @@ export class PalindromeEscrowSDK {
   }
 
   async createEscrow(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     params: CreateEscrowParams
   ) {
     assertWalletClient(walletClient);
@@ -1390,14 +1551,30 @@ export class PalindromeEscrowSDK {
   }
 
   async createEscrowAndDeposit(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     params: CreateEscrowAndDepositParams
   ) {
     assertWalletClient(walletClient);
-
     this.validateAddress(params.token, "token");
     this.validateAddress(params.seller, "seller");
     this.validateAmount(params.amount, "amount");
+
+    const accountAddress = this.getConnectedAccountOrThrow(walletClient);
+    if (!accountAddress) {
+      throw new SDKError(
+        "Missing buyer address.",
+        SDKErrorCode.WALLET_ACCOUNT_MISSING
+      );
+    }
+    const spender = this.contractAddress;
+
+    await this.ensureAllowance(
+      walletClient,
+      params.token,
+      accountAddress,
+      spender,
+      params.amount
+    );
 
     const maturityTimeDays = params.maturityTimeDays ?? 0n;
     const ipfsHash = params.ipfsHash ?? "";
@@ -1412,7 +1589,7 @@ export class PalindromeEscrowSDK {
       (params.arbiter ??
         "0x0000000000000000000000000000000000000000") as Address;
 
-    const accountAddress = this.getAccountAddress(walletClient);
+
     if (!accountAddress) {
       throw new SDKError(
         "Missing buyer address.",
@@ -1421,7 +1598,7 @@ export class PalindromeEscrowSDK {
     }
 
     const approveData = encodeFunctionData({
-      abi: this.abiUSDT,
+      abi: this.abiERC20,
       functionName: "approve",
       args: [this.contractAddress, params.amount] as const,
     });
@@ -1448,7 +1625,7 @@ export class PalindromeEscrowSDK {
     }
 
     const verifyData = encodeFunctionData({
-      abi: this.abiUSDT,
+      abi: this.abiERC20,
       functionName: "allowance",
       args: [accountAddress, this.contractAddress] as const,
     });
@@ -1528,19 +1705,23 @@ export class PalindromeEscrowSDK {
     };
   }
 
-  async deposit(walletClient: WalletClient, escrowId: bigint): Promise<Hex> {
+  async deposit(
+    walletClient: EscrowWalletClient,
+    escrowId: bigint,
+  ): Promise<Hex> {
     assertWalletClient(walletClient);
     await this.validateEscrowExists(escrowId);
     this.clearCache(escrowId);
 
     const escrow = await this.getEscrowByIdParsed(escrowId);
-    const accountAddress = this.getAccountAddress(walletClient);
+    const accountAddress = this.getConnectedAccountOrThrow(walletClient);
     if (!accountAddress) {
       throw new SDKError(
         "Missing buyer address.",
         SDKErrorCode.WALLET_ACCOUNT_MISSING
       );
     }
+    const spender = this.contractAddress;
 
     if (accountAddress.toLowerCase() !== escrow.buyer.toLowerCase()) {
       throw new SDKError(
@@ -1548,6 +1729,14 @@ export class PalindromeEscrowSDK {
         SDKErrorCode.NOT_BUYER
       );
     }
+
+    await this.ensureAllowance(
+      walletClient,
+      escrow.token,
+      accountAddress,
+      spender,
+      escrow.amount
+    );
 
     if (escrow.state !== EscrowState.AWAITING_PAYMENT) {
       throw new InvalidStateError(
@@ -1572,7 +1761,7 @@ export class PalindromeEscrowSDK {
     }
 
     const approveData = encodeFunctionData({
-      abi: this.abiUSDT,
+      abi: this.abiERC20,
       functionName: "approve",
       args: [this.contractAddress, escrow.amount] as const,
     });
@@ -1602,14 +1791,14 @@ export class PalindromeEscrowSDK {
   }
 
   async confirmDelivery(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint
   ): Promise<Hex> {
     return this.sendAndConfirm(walletClient, "confirmDelivery", [escrowId]);
   }
 
   async confirmDeliverySigned(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
     signature: Hex,
     deadline: bigint,
@@ -1618,6 +1807,27 @@ export class PalindromeEscrowSDK {
     if (this.isSignatureDeadlineExpired(deadline)) {
       throw new SignatureDeadlineExpiredError();
     }
+
+    const account = this.getConnectedAccountOrThrow(walletClient);
+    const escrow = await this.getEscrowByIdParsed(escrowId);
+
+    // State must be AWAITING_DELIVERY
+    if (escrow.state !== EscrowState.AWAITING_DELIVERY) {
+      throw new InvalidStateError(
+        this.STATE_NAMES[escrow.state],
+        "AWAITING_DELIVERY"
+      );
+    }
+
+    // Only buyer can confirm delivery
+    const role = this.getUserRoleForEscrow(account, escrow);
+    if (role !== Role.Buyer) {
+      throw new SDKError(
+        "Only the buyer can confirm delivery",
+        SDKErrorCode.NOT_BUYER
+      );
+    }
+
     return this.sendAndConfirm(walletClient, "confirmDeliverySigned", [
       escrowId,
       signature,
@@ -1628,14 +1838,14 @@ export class PalindromeEscrowSDK {
 
 
   async requestCancel(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint
   ): Promise<Hex> {
     return this.sendAndConfirm(walletClient, "requestCancel", [escrowId]);
   }
 
   async requestCancelSigned(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
     signature: Hex,
     deadline: bigint,
@@ -1644,6 +1854,30 @@ export class PalindromeEscrowSDK {
     if (this.isSignatureDeadlineExpired(deadline)) {
       throw new SignatureDeadlineExpiredError();
     }
+
+    const account = this.getConnectedAccountOrThrow(walletClient);
+    const escrow = await this.getEscrowByIdParsed(escrowId);
+
+
+    if (
+      escrow.state !== EscrowState.AWAITING_PAYMENT &&
+      escrow.state !== EscrowState.AWAITING_DELIVERY
+    ) {
+      throw new InvalidStateError(
+        this.STATE_NAMES[escrow.state],
+        "AWAITING_PAYMENT or AWAITING_DELIVERY"
+      );
+    }
+
+    // Only buyer or seller can request cancel
+    const role = this.getUserRoleForEscrow(account, escrow);
+    if (role === Role.None || role === Role.Arbiter) {
+      throw new SDKError(
+        "Only buyer or seller can request cancel",
+        SDKErrorCode.INVALID_ROLE
+      );
+    }
+
     return this.sendAndConfirm(walletClient, "requestCancelSigned", [
       escrowId,
       signature,
@@ -1653,7 +1887,7 @@ export class PalindromeEscrowSDK {
   }
 
   async startDisputeSigned(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
     signature: Hex,
     deadline: bigint,
@@ -1662,6 +1896,27 @@ export class PalindromeEscrowSDK {
     if (this.isSignatureDeadlineExpired(deadline)) {
       throw new SignatureDeadlineExpiredError();
     }
+
+    const account = this.getConnectedAccountOrThrow(walletClient);
+    const escrow = await this.getEscrowByIdParsed(escrowId);
+
+    // Must currently be AWAITING_DELIVERY (or whatever your dispute entry state is)
+    if (escrow.state !== EscrowState.AWAITING_DELIVERY) {
+      throw new InvalidStateError(
+        this.STATE_NAMES[escrow.state],
+        "AWAITING_DELIVERY"
+      );
+    }
+
+    // Only buyer or seller can start a dispute
+    const role = this.getUserRoleForEscrow(account, escrow);
+    if (role !== Role.Buyer && role !== Role.Seller) {
+      throw new SDKError(
+        "Only buyer or seller can start a dispute",
+        SDKErrorCode.INVALID_ROLE
+      );
+    }
+
     return this.sendAndConfirm(walletClient, "startDisputeSigned", [
       escrowId,
       signature,
@@ -1678,7 +1933,7 @@ export class PalindromeEscrowSDK {
    * Execute a split ERC20 payout from the escrow's multisig wallet (2-of-3).
    */
   async executeEscrowERC20Split(
-    executor: WalletClient,
+    executor: EscrowWalletClient,
     escrowWalletClient: PalindromeEscrowWalletClient,
     escrowId: bigint,
     token: Address,
@@ -1711,7 +1966,7 @@ export class PalindromeEscrowSDK {
    * Sender must be buyer or seller, state must be AWAITING_DELIVERY.
    */
   async startDispute(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
   ): Promise<Hex> {
     return this.sendAndConfirm(walletClient, "startDispute", [escrowId]);
@@ -1722,7 +1977,7 @@ export class PalindromeEscrowSDK {
  * Role is enforced in the contract (buyer/seller/arbiter).
  */
   async submitDisputeMessage(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
     role: Role,
     ipfsHash: string,
@@ -1734,7 +1989,6 @@ export class PalindromeEscrowSDK {
       ipfsHash,
     ]);
   }
-
 
   // ==========================================================================
   // DISPUTE STATUS HELPERS
@@ -1796,7 +2050,7 @@ export class PalindromeEscrowSDK {
    * Arbiter chooses between Complete (3) and Refunded (4).
    */
   async submitArbiterDecision(
-    walletClient: WalletClient,
+    walletClient: EscrowWalletClient,
     escrowId: bigint,
     resolution: DisputeResolution,
     ipfsHash: string,
