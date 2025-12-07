@@ -370,7 +370,7 @@ async function testHappyPathFullFlow() {
 
     const total = 10n * ONE_USDT;
     const netAmount = 9_900_000n;
-    const feeAmount = 100_000n;
+    const feeAmount = total - netAmount;
     const seller = sellerWalletClient.account.address;
     const feeTo = arbiterWalletClient.account.address;
 
@@ -410,6 +410,10 @@ async function testHappyPathFullFlow() {
     const sellerAfter = await sdk.getTokenBalanceOf(seller, USDT);
     const feeAfter = await sdk.getTokenBalanceOf(feeTo, USDT);
     const walletAfter = await sdk.getTokenBalanceOf(wallet, USDT);
+
+    console.log(walletBefore, walletAfter);
+    console.log(sellerBefore, sellerAfter);
+    console.log(feeBefore, feeAfter);
 
     console.assert(
         sellerAfter - sellerBefore === netAmount,
@@ -1309,6 +1313,7 @@ async function run() {
     await testHealthCheck();
     await testConfirmDeliverySigned();
     await testHappyPathFullFlow();
+    await testExecuteEscrowERC20Split();
     await testExecuteEscrowERC20Split();
     await testConfirmDeliverySignedWrongSigner();
     await testConfirmDeliverySignedExpiredDeadline();
