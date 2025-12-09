@@ -27,7 +27,7 @@ import {
 } from "./subgraph/queries";
 import { Escrow } from "./types/escrow";
 import { Chain, hardhat } from "viem/chains";
-import { PalindromeEscrowWalletClient, signWalletHash } from "./PalindromeEscrowWalletClient";
+import { PalindromeEscrowWalletClient } from "./PalindromeEscrowWalletClient";
 
 // ============================================================================
 // CONSTANTS
@@ -1802,7 +1802,8 @@ export class PalindromeEscrowSDK {
     escrowId: bigint,
     signature: Hex,
     deadline: bigint,
-    nonce: bigint
+    nonce: bigint,
+    ipfsHaesh: string,
   ): Promise<Hex> {
     if (this.isSignatureDeadlineExpired(deadline)) {
       throw new SignatureDeadlineExpiredError();
@@ -1833,7 +1834,88 @@ export class PalindromeEscrowSDK {
       signature,
       deadline,
       nonce,
+      ipfsHaesh
     ]);
+  }
+
+
+  async confirmDeliverySignedAsBuyer(
+    walletClient: EscrowWalletClient,
+    escrowId: bigint,
+  ): Promise<Hex> {
+    const buyerAddr = this.getConnectedAccountOrThrow(walletClient) as Address;
+    const deal = await this.getEscrowByIdParsed(escrowId);
+
+    if (deal.buyer.toLowerCase() !== buyerAddr.toLowerCase()) {
+      throw new Error('Only buyer can confirm delivery');
+    }
+
+    // 1) EIP-712 nonce & deadline for ConfirmDelivery (coordinator)
+    const userNonce = await this.getUserNonce(escrowId, buyerAddr as Address);
+    const deadline = await this.createSignatureDeadline(60);
+
+    const msg = await this.buildConfirmDeliveryMessage(
+      escrowId,
+      deadline,
+      userNonce,
+    );
+
+    const confirmDeliverySignature = await walletClient.signTypedData({
+      account: walletClient.account!,
+      domain: this.getEip712Domain(),
+      types: this.confirmDeliveryTypes,
+      primaryType: 'ConfirmDelivery',
+      message: msg,
+    });
+
+    // 2) Build and sign wallet ExecuteSplit as buyer co-signer
+    const wallet = deal.wallet as Address;     // escrow wallet address
+    const token = deal.token as Address;
+    const seller = deal.seller as Address;
+
+    // Fee & net amount must match what the coordinator stored in the wallet
+    // If the escrow contract precomputed net/fee and passed them to wallet ctor,
+    // you should read them from the wallet instead of recomputing here:
+    //
+    // const [netAmount, feeAmount, feeTo] = await this.readWalletTerms(wallet);
+    //
+    // For simplicity, assume 1% fee and same feeReceiver as before:
+    const feeTo = (await this.publicClient.readContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: 'feeReceiver',
+    })) as Address;
+
+    // Wallet nonce is independent from userNonce (coordinator)
+    const { nonce: walletNonce } = await this.getEscrowWalletAndNonce(escrowId);
+
+    const walletClientHelper = new PalindromeEscrowWalletClient(
+      this.publicClient,
+      this.chain.id,
+    );
+
+    // Buyer signs wallet ExecuteSplit typed data
+    const buyerWalletSig = await walletClientHelper.signExecuteSplit(walletClient, {
+      wallet,
+      token,
+      to: seller,
+      feeTo,
+      nonce: walletNonce,
+    });
+
+    // 3) Call coordinator: EIP-712 ConfirmDelivery + buyerWalletSig as "ipfsHaesh"
+    //    The contract treats this string as opaque; off-chain you later parse it
+    //    and give it to the seller as coSignerSig.
+    const txHash = await this.confirmDeliverySigned(
+      walletClient,
+      escrowId,
+      confirmDeliverySignature as Hex,
+      deadline,
+      userNonce,
+      buyerWalletSig as Hex, // encoded co-signer wallet signature
+    );
+
+    return txHash;
   }
 
 
@@ -1936,11 +2018,7 @@ export class PalindromeEscrowSDK {
     executor: EscrowWalletClient,
     escrowWalletClient: PalindromeEscrowWalletClient,
     escrowId: bigint,
-    token: Address,
     to: Address,
-    netAmount: bigint,
-    feeTo: Address,
-    feeAmount: bigint,
     signatures: [Hex, Hex, Hex],
   ): Promise<Hex> {
     // get per-escrow wallet address
@@ -1948,13 +2026,75 @@ export class PalindromeEscrowSDK {
     return escrowWalletClient.executeERC20Split(
       executor,
       wallet,
-      token,
       to,
-      netAmount,
-      feeTo,
-      feeAmount,
       signatures,
     );
+  }
+
+
+  async executeEscrowERC20SplitAsSeller(
+    sellerWalletClient: EscrowWalletClient,
+    escrowId: bigint,
+    // EIP-712 co-signer sig (buyer or arbiter) over ExecuteSplit
+    coSignerSig: Hex,
+  ): Promise<Hex> {
+    const deal = await this.getEscrowByIdParsed(escrowId);
+
+    // Enforce seller initiator at SDK level
+    const seller = deal.seller as Address;
+    if (
+      !sellerWalletClient.account ||
+      sellerWalletClient.account.address.toLowerCase() !== seller.toLowerCase()
+    ) {
+      throw new Error('Only seller can execute payout');
+    }
+
+    // 1. Get wallet + nonce
+    const { wallet, nonce: walletNonce } = await this.getEscrowWalletAndNonce(escrowId);
+    const token = deal.token as Address;
+
+    // 2. Compute 1% fee & net amount from deal.amount
+    const amount = deal.amount as bigint;
+    const feeBps = 100n; // 1%
+    const bpsDenom = 10_000n;
+    let feeAmount = (amount * feeBps) / bpsDenom;
+    if (feeAmount === 0n) feeAmount = 1n;
+    const netAmount = amount - feeAmount;
+
+    const feeTo = (await this.publicClient.readContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: 'feeReceiver',
+    })) as Address;
+
+    // 3. Build EIP-712 typed data for ExecuteSplit
+    const splitWalletClient = new PalindromeEscrowWalletClient(
+      this.publicClient,
+      this.chain.id,
+    );
+
+    // 4. Seller signs the same typed data as co-signer
+    const sellerSig = await splitWalletClient.signExecuteSplit(sellerWalletClient, {
+      wallet: wallet as Address,
+      token,
+      to: seller,
+      feeTo,
+      nonce: walletNonce,
+    });
+
+    // 5. Compose signatures array: [co-signer (buyer/arbiter), seller, empty]
+    const signatures: [Hex, Hex, Hex] = [coSignerSig, sellerSig, '0x'];
+
+    // 6. Execute split (seller is executor)
+    const execTx = await this.executeEscrowERC20Split(
+      sellerWalletClient,   // executor (seller)
+      splitWalletClient,
+      escrowId,
+      seller,
+      signatures,
+    );
+
+    return execTx;
   }
 
   // ==========================================================================
@@ -2082,41 +2222,10 @@ export class PalindromeEscrowSDK {
     );
   }
 
-  async signWalletTransferHash(
-    walletAddress: Address,
-    token: Address,
-    to: Address,
-    amount: bigint,
-    nonce: bigint
-  ): Promise<Hex> {
-    assertWalletClient(this.walletClient);
-
-    // 1. Build the hash using your wallet client helper
-    const walletClient = new PalindromeEscrowWalletClient(
-      this.publicClient,
-      this.chain.id,
-    );
-    const hash = walletClient.buildTransferHash(
-      walletAddress,
-      token,
-      to,
-      amount,
-      nonce,
-    );
-
-    // 2. Sign that hash with the connected wallet
-    const signature = await signWalletHash(
-      this.walletClient, // signer: WalletClient
-      hash,              // hash: Hex
-    );
-
-    return signature;
-  }
-
   /**
- * Poll subgraph for user escrows and invoke callback on change.
- * Simple watcher; replace with Graph subscriptions if needed.
- */
+  * Poll subgraph for user escrows and invoke callback on change.
+  * Simple watcher; replace with Graph subscriptions if needed.
+  */
   watchUserEscrows(
     userAddress: Address,
     callback: (escrowId: bigint, event: EscrowCreatedEvent) => void,

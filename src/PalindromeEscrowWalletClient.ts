@@ -4,119 +4,105 @@ import {
     WalletClient,
     Abi,
     Account,
-    encodePacked,
-    keccak256,
     Hex,
-} from "viem";
-import PalindromeEscrowWalletABI from "./contract/PalindromeEscrowWallet.json";
-
-
-export async function signWalletHash(
-    signer: WalletClient,
-    hash: Hex,
-): Promise<Hex> {
-    const signature = await signer.signMessage({
-        account: signer.account!,
-        message: { raw: hash },
-    });
-    return signature as Hex;
-}
-
+} from 'viem';
+import PalindromeEscrowWalletABI from './contract/PalindromeEscrowWallet.json';
 
 export class PalindromeEscrowWalletClient {
-    constructor(
-        readonly publicClient: PublicClient,
-        readonly chainId: number,
-    ) { }
-
+    readonly publicClient: PublicClient;
+    readonly chainId: number;
     private readonly abi: Abi = PalindromeEscrowWalletABI.abi as Abi;
 
-    buildTransferHash(
-        wallet: Address,
-        token: Address,
-        to: Address,
-        amount: bigint,
-        nonce: bigint,
-    ): Hex {
-        return keccak256(
-            encodePacked(
-                ["address", "address", "address", "uint256", "uint256", "uint256"],
-                [wallet, token, to, amount, nonce, BigInt(this.chainId)],
-            ),
-        );
+    constructor(publicClient: PublicClient, chainId: number) {
+        this.publicClient = publicClient;
+        this.chainId = chainId;
     }
 
-    buildSplitHash(
-        wallet: Address,
-        token: Address,
-        to: Address,
-        netAmount: bigint,
-        feeTo: Address,
-        feeAmount: bigint,
-        nonce: bigint,
-    ): Hex {
-        return keccak256(
-            encodePacked(
-                [
-                    "address",
-                    "address",
-                    "address",
-                    "uint256",
-                    "address",
-                    "uint256",
-                    "uint256",
-                    "uint256",
-                ],
-                [
-                    wallet,
-                    token,
-                    to,
-                    netAmount,
-                    feeTo,
-                    feeAmount,
-                    nonce,
-                    BigInt(this.chainId),
-                ],
-            ),
-        );
+    // ----- EIP-712 typed data for ExecuteSplit -----
+
+    getExecuteSplitTypedData(params: {
+        wallet: Address;
+        token: Address;
+        to: Address;
+        feeTo: Address;
+        nonce: bigint;
+    }) {
+        const { wallet, token, to, feeTo, nonce } = params;
+
+        const domain = {
+            name: 'PalindromeEscrowWallet',
+            version: '1',
+            chainId: this.chainId,
+            verifyingContract: wallet,
+        } as const;
+
+        const types = {
+            ExecuteSplit: [
+                { name: 'token', type: 'address' },
+                { name: 'to', type: 'address' },
+                { name: 'feeTo', type: 'address' },
+                { name: 'nonce', type: 'uint256' },
+            ],
+        } as const;
+
+        const message = {
+            token,
+            to,
+            feeTo,
+            nonce,
+        };
+
+        return { domain, types, message };
     }
 
-    async executeERC20(
-        executor: WalletClient,
-        wallet: Address,
-        token: Address,
-        to: Address,
-        amount: bigint,
-        signatures: [Hex, Hex, Hex],
+    /**
+     * Sign ExecuteSplit typed data for this wallet.
+     * Use for buyer/seller/arbiter signatures.
+     */
+    async signExecuteSplit(
+        signer: WalletClient,
+        params: {
+            wallet: Address;
+            token: Address;
+            to: Address;
+            feeTo: Address;
+            nonce: bigint;
+        },
     ): Promise<Hex> {
-        const txHash = await executor.writeContract({
-            address: wallet,
-            abi: this.abi,
-            functionName: "executeERC20",
-            args: [token, to, amount, signatures],
-            account: executor.account as Account,
-            chain: executor.chain,
+        if (!signer.account) {
+            throw new Error('WalletClient must have an account');
+        }
+
+        const { domain, types, message } = this.getExecuteSplitTypedData(params);
+
+        const signature = await signer.signTypedData({
+            account: signer.account!,
+            domain,
+            types,
+            primaryType: 'ExecuteSplit',
+            message,
         });
 
-        await this.publicClient.waitForTransactionReceipt({ hash: txHash });
-        return txHash;
+        return signature as Hex;
     }
+
+    // ----- Execution functions -----
 
     async executeERC20Split(
         executor: WalletClient,
         wallet: Address,
-        token: Address,
         to: Address,
-        netAmount: bigint,
-        feeTo: Address,
-        feeAmount: bigint,
         signatures: [Hex, Hex, Hex],
     ): Promise<Hex> {
+        if (!executor.account) {
+            throw new Error('Executor must have an account');
+        }
+
         const txHash = await executor.writeContract({
             address: wallet,
             abi: this.abi,
-            functionName: "executeERC20Split",
-            args: [token, to, netAmount, feeTo, feeAmount, signatures],
+            functionName: 'executeERC20Split',
+            args: [to, signatures],
             account: executor.account as Account,
             chain: executor.chain,
         });
