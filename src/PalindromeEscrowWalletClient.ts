@@ -22,12 +22,13 @@ export class PalindromeEscrowWalletClient {
 
     getExecuteSplitTypedData(params: {
         wallet: Address;
+        escrowId: bigint;
         token: Address;
         to: Address;
         feeTo: Address;
         nonce: bigint;
     }) {
-        const { wallet, token, to, feeTo, nonce } = params;
+        const { wallet, escrowId, token, to, feeTo, nonce } = params;
 
         const domain = {
             name: 'PalindromeEscrowWallet',
@@ -38,6 +39,7 @@ export class PalindromeEscrowWalletClient {
 
         const types = {
             ExecuteSplit: [
+                { name: 'escrowId', type: 'uint256' },
                 { name: 'token', type: 'address' },
                 { name: 'to', type: 'address' },
                 { name: 'feeTo', type: 'address' },
@@ -46,6 +48,7 @@ export class PalindromeEscrowWalletClient {
         } as const;
 
         const message = {
+            escrowId,
             token,
             to,
             feeTo,
@@ -63,15 +66,14 @@ export class PalindromeEscrowWalletClient {
         signer: WalletClient,
         params: {
             wallet: Address;
+            escrowId: bigint;
             token: Address;
             to: Address;
             feeTo: Address;
             nonce: bigint;
         },
     ): Promise<Hex> {
-        if (!signer.account) {
-            throw new Error('WalletClient must have an account');
-        }
+        if (!signer.account) throw new Error('WalletClient must have an account');
 
         const { domain, types, message } = this.getExecuteSplitTypedData(params);
 
@@ -85,6 +87,7 @@ export class PalindromeEscrowWalletClient {
 
         return signature as Hex;
     }
+
 
     // ----- Execution functions -----
 

@@ -79,7 +79,14 @@ export enum SDKErrorCode {
   CACHE_ERROR = "CACHE_ERROR",
   VALIDATION_ERROR = "VALIDATION_ERROR",
   RPC_ERROR = "RPC_ERROR",
+  INVALID_ARGS = "INVALID_ARGS",
 }
+
+export type AttachSellerWalletSigResult = {
+  escrowId: bigint;
+  sellerSig: Hex;
+  txHash: Hex;
+};
 
 export type EscrowWalletClient = WalletClient<
   Transport,
@@ -171,7 +178,7 @@ export interface CreateEscrowParams {
   maturityTimeDays?: bigint;
   arbiter?: Address;
   title: string;
-  ipfsHash?: string;
+  ipfsHash: string;
 }
 
 export interface CreateEscrowAndDepositParams {
@@ -680,7 +687,6 @@ export class PalindromeEscrowSDK {
     return this.getEscrowByIdParsed(escrowId);
   }
 
-
   /**
  * Read a per-signer nonce from the bitmap by scanning buckets.
  */
@@ -711,8 +717,6 @@ export class PalindromeEscrowSDK {
     );
   }
 
-
-
   // ==========================================================================
   // SUBGRAPH
   // ==========================================================================
@@ -742,7 +746,6 @@ export class PalindromeEscrowSDK {
     this.setCache(key, escrows, 10000);
     return escrows;
   }
-
 
   async getEscrowsByBuyer(buyer: string): Promise<Escrow[]> {
     this.validateAddress(buyer, "buyer");
@@ -1011,7 +1014,6 @@ export class PalindromeEscrowSDK {
       { name: "depositTime", type: "uint256" },
       { name: "deadline", type: "uint256" },
       { name: "nonce", type: "uint256" },
-      { name: "contractNonce", type: "uint256" },
     ],
   } as const;
 
@@ -1026,7 +1028,6 @@ export class PalindromeEscrowSDK {
       { name: "depositTime", type: "uint256" },
       { name: "deadline", type: "uint256" },
       { name: "nonce", type: "uint256" },
-      { name: "contractNonce", type: "uint256" },
     ],
   } as const;
 
@@ -1041,7 +1042,6 @@ export class PalindromeEscrowSDK {
       { name: "depositTime", type: "uint256" },
       { name: "deadline", type: "uint256" },
       { name: "nonce", type: "uint256" },
-      { name: "contractNonce", type: "uint256" },
     ],
   } as const;
 
@@ -1065,13 +1065,6 @@ export class PalindromeEscrowSDK {
   ) {
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    // Read contractNonce from the escrow contract
-    const contractNonce = await this.publicClient.readContract({
-      address: this.contractAddress,
-      abi: this.abiEscrow,
-      functionName: "contractNonce",
-    }) as bigint;
-
     return {
       escrowId,
       buyer: deal.buyer,
@@ -1082,7 +1075,6 @@ export class PalindromeEscrowSDK {
       depositTime: deal.depositTime,
       deadline,
       nonce,
-      contractNonce,
     } as const;
   }
 
@@ -1094,12 +1086,6 @@ export class PalindromeEscrowSDK {
   ) {
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    const contractNonce = await this.publicClient.readContract({
-      address: this.contractAddress,
-      abi: this.abiEscrow,
-      functionName: "contractNonce",
-    }) as bigint;
-
     return {
       escrowId,
       buyer: deal.buyer,
@@ -1110,7 +1096,6 @@ export class PalindromeEscrowSDK {
       depositTime: deal.depositTime,
       deadline,
       nonce,
-      contractNonce,
     } as const;
   }
 
@@ -1122,12 +1107,6 @@ export class PalindromeEscrowSDK {
   ) {
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    const contractNonce = await this.publicClient.readContract({
-      address: this.contractAddress,
-      abi: this.abiEscrow,
-      functionName: "contractNonce",
-    }) as bigint;
-
     return {
       escrowId,
       buyer: deal.buyer,
@@ -1138,7 +1117,6 @@ export class PalindromeEscrowSDK {
       depositTime: deal.depositTime,
       deadline,
       nonce,
-      contractNonce,
     } as const;
   }
 
@@ -1467,6 +1445,72 @@ export class PalindromeEscrowSDK {
     };
   }
 
+  async attachSellerWalletSig(
+    sellerWalletClient: EscrowWalletClient,
+    escrowId: bigint,
+    sellerSig: Hex,
+  ): Promise<AttachSellerWalletSigResult> {
+    assertWalletClient(sellerWalletClient);
+
+    // Basic validation
+    if (escrowId < 0n) {
+      throw new SDKError('Invalid escrowId', SDKErrorCode.INVALID_ARGS);
+    }
+    if (!sellerSig || sellerSig === '0x') {
+      throw new SDKError('sellerSig required', SDKErrorCode.INVALID_ARGS);
+    }
+
+    // Write tx
+    const hash = await sellerWalletClient.writeContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: 'attachSellerWalletSig',
+      args: [escrowId, sellerSig],
+      account: sellerWalletClient.account,
+      chain: this.chain,
+    });
+
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+
+    if (receipt.status !== 'success') {
+      throw new SDKError(
+        'Transaction failed on-chain',
+        SDKErrorCode.TRANSACTION_FAILED,
+        { txHash: hash, receipt },
+      );
+    }
+
+    // Parse SellerWalletSigAttached(escrowId, sellerSig)
+    try {
+      const events = parseEventLogs({
+        abi: this.abiEscrow,
+        eventName: 'SellerWalletSigAttached',
+        logs: receipt.logs,
+      }) as Array<{ args: { escrowId: bigint; sellerSig: Hex } }>;
+
+      if (events.length > 0) {
+        const event = events[0].args;
+        // optional cache invalidation if you cache escrow details
+        this.clearCache?.(event.escrowId, 'escrows');
+        return {
+          escrowId: event.escrowId,
+          sellerSig: event.sellerSig,
+          txHash: hash,
+        };
+      }
+    } catch (err) {
+      console.warn('Failed to parse SellerWalletSigAttached event:', err);
+    }
+
+    // Fallback if logs missing (should be rare)
+    return {
+      escrowId,
+      sellerSig,
+      txHash: hash,
+    };
+  }
+
+
   async createEscrow(
     walletClient: EscrowWalletClient,
     params: CreateEscrowParams
@@ -1475,6 +1519,9 @@ export class PalindromeEscrowSDK {
 
     this.validateAddress(params.token, "token");
     this.validateAddress(params.buyer, "buyer");
+    if (params.arbiter) {
+      this.validateAddress(params.arbiter, "arbiter");
+    }
     this.validateAmount(params.amount, "amount");
 
     const maturityTimeDays = params.maturityTimeDays ?? 0n;
@@ -1501,7 +1548,7 @@ export class PalindromeEscrowSDK {
         maturityTimeDays,
         arbiter,
         params.title,
-        ipfsHash,
+        ipfsHash
       ],
       account: walletClient.account,
       chain: this.chain,
@@ -1547,6 +1594,64 @@ export class PalindromeEscrowSDK {
       escrowId: createdId,
       txHash: hash,
       maturityTime: 0n,
+    };
+  }
+
+  async createEscrowWithSellerSig(
+    sellerWalletClient: EscrowWalletClient,
+    params: CreateEscrowParams,
+  ): Promise<{
+    escrowId: bigint;
+    txHashCreate: Hex;
+    txHashAttach: Hex;
+    sellerSig: Hex;
+  }> {
+    // 1. Create escrow
+    const { escrowId, txHash: txHashCreate } =
+      await this.createEscrow(sellerWalletClient, params);
+
+    // 2. Read deal + wallet + wallet nonce
+    const deal = await this.getEscrowByIdParsed(escrowId);
+    const { wallet, nonce: walletNonce } =
+      await this.getEscrowWalletAndNonce(escrowId);
+
+    // 3. Read feeTo from coordinator
+    const feeTo = await this.publicClient.readContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: 'feeReceiver',
+    }) as Address;
+
+    // 4. Build wallet ExecuteSplit typed data and sign as seller
+    const walletClientHelper = new PalindromeEscrowWalletClient(
+      this.publicClient,
+      this.chain.id,
+    );
+
+    const sellerSig = await walletClientHelper.signExecuteSplit(
+      sellerWalletClient,
+      {
+        wallet,
+        escrowId,
+        token: deal.token as Address,
+        to: deal.buyer as Address,   // refund-to-buyer path
+        feeTo,
+        nonce: walletNonce,
+      },
+    );
+
+    // 5. Attach seller signature on escrow contract
+    const { txHash: txHashAttach } = await this.attachSellerWalletSig(
+      sellerWalletClient,
+      escrowId,
+      sellerSig,
+    );
+
+    return {
+      escrowId,
+      txHashCreate,
+      txHashAttach,
+      sellerSig,
     };
   }
 
@@ -1897,6 +2002,7 @@ export class PalindromeEscrowSDK {
     // Buyer signs wallet ExecuteSplit typed data
     const buyerWalletSig = await walletClientHelper.signExecuteSplit(walletClient, {
       wallet,
+      escrowId,
       token,
       to: seller,
       feeTo,
@@ -2032,11 +2138,11 @@ export class PalindromeEscrowSDK {
   }
 
 
-  async executeEscrowERC20SplitAsSeller(
+  async withdrawSeller(
     sellerWalletClient: EscrowWalletClient,
     escrowId: bigint,
     // EIP-712 co-signer sig (buyer or arbiter) over ExecuteSplit
-    coSignerSig: Hex,
+    buyerSig: Hex,
   ): Promise<Hex> {
     const deal = await this.getEscrowByIdParsed(escrowId);
 
@@ -2049,17 +2155,8 @@ export class PalindromeEscrowSDK {
       throw new Error('Only seller can execute payout');
     }
 
-    // 1. Get wallet + nonce
     const { wallet, nonce: walletNonce } = await this.getEscrowWalletAndNonce(escrowId);
     const token = deal.token as Address;
-
-    // 2. Compute 1% fee & net amount from deal.amount
-    const amount = deal.amount as bigint;
-    const feeBps = 100n; // 1%
-    const bpsDenom = 10_000n;
-    let feeAmount = (amount * feeBps) / bpsDenom;
-    if (feeAmount === 0n) feeAmount = 1n;
-    const netAmount = amount - feeAmount;
 
     const feeTo = (await this.publicClient.readContract({
       address: this.contractAddress,
@@ -2067,30 +2164,83 @@ export class PalindromeEscrowSDK {
       functionName: 'feeReceiver',
     })) as Address;
 
-    // 3. Build EIP-712 typed data for ExecuteSplit
-    const splitWalletClient = new PalindromeEscrowWalletClient(
+    const walletClientHelper = new PalindromeEscrowWalletClient(
       this.publicClient,
       this.chain.id,
     );
 
-    // 4. Seller signs the same typed data as co-signer
-    const sellerSig = await splitWalletClient.signExecuteSplit(sellerWalletClient, {
+    const params = {
       wallet: wallet as Address,
+      escrowId,
       token,
-      to: seller,
+      to: seller,        // or buyer depending on state
+      feeTo,             // the same address the wallet stored
+      nonce: walletNonce // from await wallet.read.nonce()
+    };
+
+    const sellerSig = await walletClientHelper.signExecuteSplit(sellerWalletClient, params);
+
+    const signatures: [Hex, Hex, Hex] = [buyerSig, sellerSig, '0x'];
+
+
+    const execTx = await this.executeEscrowERC20Split(
+      sellerWalletClient,
+      walletClientHelper,
+      escrowId,
+      seller,
+      signatures,
+    );
+
+    return execTx;
+  }
+
+
+  async withdrawBuyer(
+    buyerWalletClient: EscrowWalletClient,
+    escrowId: bigint,
+    sellerSig: Hex,
+  ): Promise<Hex> {
+    const deal = await this.getEscrowByIdParsed(escrowId);
+
+    // Enforce seller initiator at SDK level
+    const buyer = deal.buyer as Address;
+    if (
+      !buyerWalletClient.account ||
+      buyerWalletClient.account.address.toLowerCase() !== buyer.toLowerCase()
+    ) {
+      throw new Error('Only seller can execute payout');
+    }
+
+    const { wallet, nonce: walletNonce } = await this.getEscrowWalletAndNonce(escrowId);
+    const token = deal.token as Address;
+
+    const feeTo = (await this.publicClient.readContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: 'feeReceiver',
+    })) as Address;
+
+    const walletClientHelper = new PalindromeEscrowWalletClient(
+      this.publicClient,
+      this.chain.id,
+    );
+
+    const buyerSig = await walletClientHelper.signExecuteSplit(buyerWalletClient, {
+      wallet: wallet as Address,
+      escrowId,
+      token,
+      to: buyer,
       feeTo,
       nonce: walletNonce,
     });
 
-    // 5. Compose signatures array: [co-signer (buyer/arbiter), seller, empty]
-    const signatures: [Hex, Hex, Hex] = [coSignerSig, sellerSig, '0x'];
+    const signatures: [Hex, Hex, Hex] = [sellerSig, buyerSig, '0x'];
 
-    // 6. Execute split (seller is executor)
     const execTx = await this.executeEscrowERC20Split(
-      sellerWalletClient,   // executor (seller)
-      splitWalletClient,
+      buyerWalletClient,
+      walletClientHelper,
       escrowId,
-      seller,
+      buyer,
       signatures,
     );
 

@@ -364,6 +364,7 @@ async function testExecuteEscrowERC20SplitAsSeller() {
 
     const buyerSig: Hex = await walletClient.signExecuteSplit(buyerWalletClient, {
         wallet: wallet as Address,
+        escrowId,
         token,
         to: seller,
         feeTo,
@@ -372,10 +373,10 @@ async function testExecuteEscrowERC20SplitAsSeller() {
 
     // 6. Execute split as seller via SDK helper (seller signs inside helper)
     console.log('Executing 2-of-3 payout via seller...');
-    const execTx = await sdk.executeEscrowERC20SplitAsSeller(
+    const execTx = await sdk.withdrawSeller(
         sellerWalletClient, // executor: must be seller
         escrowId,
-        buyerSig,           // coSignerSig (buyer) over ExecuteSplit
+        buyerSig,
     );
     await publicClient.waitForTransactionReceipt({ hash: execTx });
 
@@ -441,7 +442,7 @@ async function testExecuteEscrowERC20SplitAsSellerFullFlow() {
         confirmSig as Hex,
         deadline,
         userNonce,
-        '0x', // not using ipfsHaesh/buyerSig channel in this test
+        '0x',
     );
     await publicClient.waitForTransactionReceipt({ hash: confirmTx });
 
@@ -451,7 +452,6 @@ async function testExecuteEscrowERC20SplitAsSellerFullFlow() {
         `Expected COMPLETE after confirm, got ${status.stateName}`,
     );
 
-    // 3. Resolve wallet & wallet nonce
     const { wallet, nonce: walletNonce } = await sdk.getEscrowWalletAndNonce(
         escrowId,
     );
@@ -465,21 +465,21 @@ async function testExecuteEscrowERC20SplitAsSellerFullFlow() {
     if (feeAmount === 0n) feeAmount = 1n;
     const netAmount = amount - feeAmount;
 
-    const feeReceiver = (await publicClient.readContract({
+    const feeTo = (await publicClient.readContract({
         address: contractAddress,
         abi: sdk.abiEscrow,
         functionName: 'feeReceiver',
     })) as Address;
 
     console.assert(
-        feeReceiver.toLowerCase() ===
+        feeTo.toLowerCase() ===
         '0x90f79bf6eb2c4f870365e785982e1f101e93b906'.toLowerCase(),
-        `feeReceiver mismatch, got ${feeReceiver}`,
+        `feeTo mismatch, got ${feeTo}`,
     );
 
     // 5. Snapshot balances
     const sellerBefore = await sdk.getTokenBalanceOf(seller, token);
-    const feeBefore = await sdk.getTokenBalanceOf(feeReceiver, token);
+    const feeBefore = await sdk.getTokenBalanceOf(feeTo, token);
     const walletBefore = await sdk.getTokenBalanceOf(wallet as Address, token);
 
     // 6. Build EIP-712 ExecuteSplit typed data and buyer co-signature
@@ -488,17 +488,20 @@ async function testExecuteEscrowERC20SplitAsSellerFullFlow() {
         chain.id,
     );
 
-    const buyerSig = await walletClientHelper.signExecuteSplit(buyerWalletClient, {
+    const params = {
         wallet: wallet as Address,
+        escrowId,
         token,
-        to: seller,
-        feeTo: feeReceiver,
-        nonce: walletNonce,
-    });
+        to: seller,        // or buyer depending on state
+        feeTo,             // the same address the wallet stored
+        nonce: walletNonce // from await wallet.read.nonce()
+    };
+
+    const buyerSig = await walletClientHelper.signExecuteSplit(buyerWalletClient, params);
 
     // 7. Execute split as seller via SDK helper (seller signs inside helper)
     console.log('Executing 2-of-3 payout via seller...');
-    const execTx = await sdk.executeEscrowERC20SplitAsSeller(
+    const execTx = await sdk.withdrawSeller(
         sellerWalletClient, // executor (seller)
         escrowId,
         buyerSig,          // co-signer (buyer) EIP-712 sig over SAME struct
@@ -507,7 +510,7 @@ async function testExecuteEscrowERC20SplitAsSellerFullFlow() {
 
     // 8. Check balances
     const sellerAfter = await sdk.getTokenBalanceOf(seller, token);
-    const feeAfter = await sdk.getTokenBalanceOf(feeReceiver, token);
+    const feeAfter = await sdk.getTokenBalanceOf(feeTo, token);
     const walletAfter = await sdk.getTokenBalanceOf(wallet as Address, token);
 
     console.assert(
@@ -522,12 +525,264 @@ async function testExecuteEscrowERC20SplitAsSellerFullFlow() {
     console.log('---------------------------');
     console.log('---------------------------');
     console.log(
-        `Fee receiver ${feeReceiver} received ${feeAfter - feeBefore}, expected ${feeAmount}`,
+        `Fee receiver ${feeTo} received ${feeAfter - feeBefore}, expected ${feeAmount}`,
     );
     console.log('---------------------------');
     console.assert(
         feeAfter - feeBefore === feeAmount,
-        `Fee receiver ${feeReceiver} received ${feeAfter - feeBefore}, expected ${feeAmount}`,
+        `Fee receiver ${feeTo} received ${feeAfter - feeBefore}, expected ${feeAmount}`,
+    );
+
+    console.assert(
+        walletBefore - walletAfter === amount,
+        `Wallet drained by ${walletBefore - walletAfter}, expected ${amount}`,
+    );
+
+    console.log('TEST passed executeEscrowERC20SplitAsSeller full flow');
+}
+
+async function testExecuteEscrowERC20SplitAsBuyerFullFlow2() {
+    console.log('\nFULL: executeEscrowERC20Split refund-to-buyer\n');
+
+    const params: CreateEscrowParams = {
+        token: USDT,
+        buyer: buyerWalletClient.account.address,
+        amount: 10n * ONE_USDT,
+        maturityTimeDays: 0n,
+        arbiter: arbiterAccount.address,
+        title: "Coverage Test",
+        ipfsHash: "QmCoverage...",
+    };
+
+    // 1. Create escrow + attach sellerSig
+    const { escrowId, sellerSig } = await sdk.createEscrowWithSellerSig(sellerWalletClient, params);
+
+    // 2. Deposit into escrow (existing helper)
+    await testDepositEscrow(escrowId);
+
+    let status = await sdk.getEscrowStatus(escrowId, true);
+    console.assert(
+        status.stateName === 'AWAITING_DELIVERY',
+        `Expected AWAITING_DELIVERY, got ${status.stateName}`,
+    );
+
+    const deal = await sdk.getEscrowByIdParsed(escrowId);
+    const { wallet } = await sdk.getEscrowWalletAndNonce(escrowId);
+    const token = deal.token as Address;
+    const buyer = deal.buyer as Address;
+
+    const feeTo = await publicClient.readContract({
+        address: contractAddress,
+        abi: sdk.abiEscrow,
+        functionName: 'feeReceiver',
+    }) as Address;
+
+    // 3. Cancel (buyer + seller) so state becomes CANCELED (refund path)
+    const tx1 = await sdk.requestCancel(buyerWalletClient, escrowId);
+    await publicClient.waitForTransactionReceipt({ hash: tx1 });
+
+    const tx2 = await sdk.requestCancel(sellerWalletClient, escrowId);
+    await publicClient.waitForTransactionReceipt({ hash: tx2 });
+
+    status = await sdk.getEscrowStatus(escrowId, true);
+    console.assert(
+        status.stateName === 'CANCELED',
+        `Expected CANCELED, got ${status.stateName}`,
+    );
+
+    // 4. Expected amounts
+    const amount = deal.amount as bigint;
+    const feeBps = 100n;
+    const bpsDenom = 10_000n;
+    let feeAmount = (amount * feeBps) / bpsDenom;
+    if (feeAmount === 0n) feeAmount = 1n;
+    const netAmount = amount - feeAmount;
+
+    // 5. Snapshot balances
+    const buyerBefore = await sdk.getTokenBalanceOf(buyer, token);
+    const feeBefore = await sdk.getTokenBalanceOf(feeTo, token);
+    const walletBefore = await sdk.getTokenBalanceOf(wallet as Address, token);
+
+    // 6. Buyer withdraws using sellerSig as co-signer
+    const execTx = await sdk.withdrawBuyer(
+        buyerWalletClient,
+        escrowId,
+        sellerSig, // co-signer (seller) ExecuteSplit sig with to=buyer
+    );
+    await publicClient.waitForTransactionReceipt({ hash: execTx });
+
+    // 7. Check balances
+    const buyerAfter = await sdk.getTokenBalanceOf(buyer, token);
+    const feeAfter = await sdk.getTokenBalanceOf(feeTo, token);
+    const walletAfter = await sdk.getTokenBalanceOf(wallet as Address, token);
+
+    console.log(`Buyer received ${buyerAfter - buyerBefore}, expected ${netAmount}`);
+    console.assert(
+        buyerAfter - buyerBefore === netAmount,
+        `Buyer received ${buyerAfter - buyerBefore}, expected ${netAmount}`,
+    );
+    console.log(`Fee receiver ${feeTo} received ${feeAfter - feeBefore}, expected ${feeAmount}`);
+    console.assert(
+        feeAfter - feeBefore === feeAmount,
+        `Fee receiver ${feeTo} received ${feeAfter - feeBefore}, expected ${feeAmount}`,
+    );
+    console.log(`Wallet drained by ${walletBefore - walletAfter}, expected ${amount}`);
+    console.assert(
+        walletBefore - walletAfter === amount,
+        `Wallet drained by ${walletBefore - walletAfter}, expected ${amount}`,
+    );
+
+    console.log('✅ TEST passed executeEscrowERC20SplitAsBuyerFullFlow\n');
+}
+
+
+async function testExecuteEscrowERC20SplitAsBuyerFullFlow() {
+    console.log('FULL: executeEscrowERC20SplitAsSeller payout + fee receiver');
+
+    // 1. Create escrow and deposit so we have funds in the wallet
+    const id = await createEscrow(7n);
+
+    const deal = await sdk.getEscrowByIdParsed(id);           // token, buyer, seller, wallet
+    const { wallet, nonce } = await sdk.getEscrowWalletAndNonce(id);
+    const token = deal.token as Address;
+
+    const feeTo = await publicClient.readContract({
+        address: sdk.contractAddress,
+        abi: sdk.abiEscrow,
+        functionName: 'feeReceiver',
+    }) as Address;
+
+    const walletClientHelper = new PalindromeEscrowWalletClient(publicClient, chain.id);
+
+    const sellerSignature = await walletClientHelper.signExecuteSplit(sellerWalletClient, {
+        wallet: wallet as Address,
+        escrowId: id,
+        token,
+        to: deal.buyer as Address,   // because this flow is refund-to-buyer
+        feeTo,
+        nonce,
+    });
+
+    const txHash = await sellerWalletClient.writeContract({
+        address: sdk.contractAddress,
+        abi: sdk.abiEscrow,
+        functionName: 'attachSellerWalletSig',
+        args: [id, sellerSignature],
+        account: sellerWalletClient.account,
+        chain: sellerWalletClient.chain,
+    });
+    const receipt = await publicClient.getTransactionReceipt({ hash: txHash });
+
+    const logs = parseEventLogs({
+        abi: sdk.abiEscrow,
+        eventName: 'SellerWalletSigAttached',
+        logs: receipt.logs,
+    });
+
+    const { escrowId, sellerSig } = logs[0].args as {
+        escrowId: bigint;
+        sellerSig: Hex;
+    }
+
+    await testDepositEscrow(escrowId);
+
+    let status = await sdk.getEscrowStatus(escrowId, true);
+    console.assert(
+        status.stateName === 'AWAITING_DELIVERY',
+        `Expected AWAITING_DELIVERY, got ${status.stateName}`,
+    );
+
+    const seller = deal.seller as Address;
+    const buyer = deal.buyer as Address;
+
+    // // 2. Confirm delivery via EIP-712 meta-tx on the coordinator
+    const userNonce = await sdk.getUserNonce(escrowId, buyer);
+    const deadline = await sdk.createSignatureDeadline(60);
+    const msg = await (sdk as any).buildConfirmDeliveryMessage(
+        escrowId,
+        deadline,
+        userNonce,
+    );
+
+    const confirmSig = await buyerWalletClient.signTypedData({
+        account: buyerWalletClient.account!,
+        domain: (sdk as any).getEip712Domain(),
+        types: (sdk as any).confirmDeliveryTypes,
+        primaryType: 'ConfirmDelivery',
+        message: msg,
+    });
+
+    const confirmTx1 = await sdk.requestCancel(buyerWalletClient, escrowId);
+    await publicClient.waitForTransactionReceipt({ hash: confirmTx1 });
+    const confirmTx2 = await sdk.requestCancel(sellerWalletClient, escrowId);
+    await publicClient.waitForTransactionReceipt({ hash: confirmTx2 });
+
+    status = await sdk.getEscrowStatus(escrowId, true);
+    console.assert(
+        status.stateName === 'CANCELED',
+        `Expected CANCELED after confirm, got ${status.stateName}`,
+    );
+
+    // 4. Compute 1% fee & netAmount from deal.amount (must match escrow logic)
+    const amount = deal.amount as bigint;
+    const feeBps = 100n;
+    const bpsDenom = 10_000n;
+    let feeAmount = (amount * feeBps) / bpsDenom;
+    if (feeAmount === 0n) feeAmount = 1n;
+    const netAmount = amount - feeAmount;
+
+    console.assert(
+        feeTo.toLowerCase() ===
+        '0x90f79bf6eb2c4f870365e785982e1f101e93b906'.toLowerCase(),
+        `feeTo mismatch, got ${feeTo}`,
+    );
+
+    // 5. Snapshot balances
+    const buyerBefore = await sdk.getTokenBalanceOf(buyer, token);
+    const feeBefore = await sdk.getTokenBalanceOf(feeTo, token);
+    const walletBefore = await sdk.getTokenBalanceOf(wallet as Address, token);
+
+    const params = {
+        wallet: wallet as Address,
+        escrowId,
+        token,
+        to: seller,        // or buyer depending on state
+        feeTo,             // the same address the wallet stored
+        nonce // from await wallet.read.nonce()
+    };
+
+    // 7. Execute split as seller via SDK helper (seller signs inside helper)
+    console.log('Executing 2-of-3 payout via seller...');
+    const execTx = await sdk.withdrawBuyer(
+        buyerWalletClient, // executor (seller)
+        escrowId,
+        sellerSig,          // co-signer (buyer) EIP-712 sig over SAME struct
+    );
+    await publicClient.waitForTransactionReceipt({ hash: execTx });
+
+    // 8. Check balances
+    const buyerAfter = await sdk.getTokenBalanceOf(buyer, token);
+    const feeAfter = await sdk.getTokenBalanceOf(feeTo, token);
+    const walletAfter = await sdk.getTokenBalanceOf(wallet as Address, token);
+
+    console.assert(
+        buyerAfter - buyerBefore === netAmount,
+        `Buyer received ${buyerAfter - buyerBefore}, expected ${netAmount}`,
+    );
+    console.log('---------------------------');
+    console.log(
+        buyerAfter - buyerBefore === netAmount,
+        `Buyer received ${buyerAfter - buyerBefore}, expected ${netAmount}`,
+    );
+    console.log('---------------------------');
+    console.log('---------------------------');
+    console.log(
+        `Fee receiver ${feeTo} received ${feeAfter - feeBefore}, expected ${feeAmount}`,
+    );
+    console.log('---------------------------');
+    console.assert(
+        feeAfter - feeBefore === feeAmount,
+        `Fee receiver ${feeTo} received ${feeAfter - feeBefore}, expected ${feeAmount}`,
     );
 
     console.assert(
@@ -663,7 +918,7 @@ async function testHappyPathFullFlow() {
     if (feeAmount === 0n) feeAmount = 1n;
     const netAmount = amount - feeAmount;
 
-    // Use protocol feeReceiver, not arbiter
+    // Use protocol feeTo, not arbiter
     const feeTo = (await publicClient.readContract({
         address: contractAddress,
         abi: sdk.abiEscrow,
@@ -685,6 +940,7 @@ async function testHappyPathFullFlow() {
 
     const buyerSig = await walletClientHelper.signExecuteSplit(buyerWalletClient, {
         wallet: wallet as Address,
+        escrowId,
         token,
         to: seller,
         feeTo,
@@ -695,6 +951,7 @@ async function testHappyPathFullFlow() {
         sellerWalletClient,
         {
             wallet: wallet as Address,
+            escrowId,
             token,
             to: seller,
             feeTo,
@@ -796,6 +1053,7 @@ async function testExecuteEscrowERC20Split() {
 
     const buyerSig: Hex = await walletClient.signExecuteSplit(buyerWalletClient, {
         wallet: wallet as Address,
+        escrowId,
         token,
         to: seller,
         feeTo,
@@ -804,6 +1062,7 @@ async function testExecuteEscrowERC20Split() {
 
     const sellerSig: Hex = await walletClient.signExecuteSplit(sellerWalletClient, {
         wallet: wallet as Address,
+        escrowId,
         token,
         to: seller,
         feeTo,
@@ -1292,6 +1551,7 @@ async function testSubmitArbiterDecisionCompleteAndRefunded() {
 
         const sellerBefore = await sdk.getTokenBalanceOf(seller, deal.token);
         const buyerBefore = await sdk.getTokenBalanceOf(buyer, deal.token);
+        await increaseTime(24 * 60 * 60);
 
         await sdk.submitArbiterDecision(
             arbiterWalletClient,
@@ -1340,6 +1600,8 @@ async function testSubmitArbiterDecisionCompleteAndRefunded() {
 
         const seller = deal.seller;
         const buyer = deal.buyer;
+
+        await increaseTime(24 * 60 * 60);
 
         const sellerBefore = await sdk.getTokenBalanceOf(seller, deal.token);
         const buyerBefore = await sdk.getTokenBalanceOf(buyer, deal.token);
@@ -1639,11 +1901,11 @@ async function run() {
     console.log("=== PALINDROME ESCROW SDK – COVERAGE SUITE ===\n");
 
     await testHealthCheck();
+    await testExecuteEscrowERC20SplitAsBuyerFullFlow2();
     await testConfirmDeliverySignedAsBuyer();
-    await testExecuteEscrowERC20SplitAsSeller();
     await testExecuteEscrowERC20SplitAsSellerFullFlow()
+    await testExecuteEscrowERC20SplitAsBuyerFullFlow()
     await testHappyPathFullFlow();
-    await testExecuteEscrowERC20Split();
     await testConfirmDeliverySignedWrongSigner();
     await testConfirmDeliverySigned();
     await testConfirmDeliverySignedExpiredDeadline();

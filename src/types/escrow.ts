@@ -11,6 +11,7 @@ export interface Escrow {
   state: string;
   title?: string;
   ipfsHash?: string;
+  ipfsHaesh?: string;
   createdAt: string;
   updatedAt?: string;
   buyerCancelRequested?: boolean;

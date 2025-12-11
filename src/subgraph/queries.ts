@@ -19,6 +19,8 @@ export const ALL_ESCROWS_QUERY = gql`
       state
       title
       ipfsHash
+      ipfsHaesh
+      sellerWalletSig
       createdAt
       updatedAt
       buyerCancelRequested
@@ -52,6 +54,8 @@ export const ESCROWS_BY_BUYER_QUERY = gql`
       state
       title
       ipfsHash
+      ipfsHaesh
+      sellerWalletSig
       createdAt
       updatedAt
       buyerCancelRequested
@@ -85,6 +89,8 @@ export const ESCROWS_BY_SELLER_QUERY = gql`
       state
       title
       ipfsHash
+      ipfsHaesh
+      sellerWalletSig
       createdAt
       updatedAt
       buyerCancelRequested
@@ -117,6 +123,8 @@ export const ESCROW_DETAIL_QUERY = gql`
       state
       title
       ipfsHash
+      ipfsHaesh
+      sellerWalletSig
       createdAt
       updatedAt
       buyerCancelRequested
@@ -160,6 +168,8 @@ export const DISPUTE_MESSAGES_BY_ESCROW_QUERY = gql`
         roleValue
         sender
         ipfsHash
+        ipfsHaesh
+        sellerWalletSig
         disputeStatus
         timestamp
         txHash
@@ -184,6 +194,8 @@ export const ALL_DISPUTED_ESCROWS_QUERY = gql`
       state
       title
       ipfsHash
+      ipfsHaesh
+      sellerWalletSig
       createdAt
       updatedAt
       disputeStatus
@@ -215,6 +227,8 @@ export const ESCROW_WITH_DISPUTE_DETAILS_QUERY = gql`
       state
       title
       ipfsHash
+      ipfsHaesh
+      sellerWalletSig
       createdAt
       updatedAt
       buyerCancelRequested
@@ -266,7 +280,6 @@ export const DISPUTED_ESCROWS_BY_BUYER_QUERY = gql`
   }
 `;
 
-// Get disputed escrows by seller
 export const DISPUTED_ESCROWS_BY_SELLER_QUERY = gql`
   query DisputedEscrowsBySeller($seller: Bytes!) {
     escrows(where: { seller: $seller, state: "DISPUTED" }) {
