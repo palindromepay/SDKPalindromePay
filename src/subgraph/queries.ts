@@ -168,9 +168,6 @@ export const DISPUTE_MESSAGES_BY_ESCROW_QUERY = gql`
         roleValue
         sender
         ipfsHash
-        ipfsHaesh
-        sellerWalletSig
-        disputeStatus
         timestamp
         txHash
       }

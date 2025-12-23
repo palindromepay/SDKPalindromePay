@@ -1280,80 +1280,6 @@ async function testRequestCancelMutual() {
     console.log("✅ TEST passed: requestCancel – mutual on‑chain\n");
 }
 
-async function testRequestCancelSigned() {
-    console.log("\nTEST: requestCancelSigned – buyer & seller\n");
-
-    const escrowId = await createEscrow(7n);
-    await testDepositEscrow(escrowId);
-
-    // Buyer signed cancel
-    {
-        const deal = await sdk.getEscrowByIdParsed(escrowId);
-        const nonce = await sdk.getUserNonce(escrowId, deal.buyer);
-        const deadline = await sdk.createSignatureDeadline(60);
-        const msg = await (sdk as any).buildRequestCancelMessage(
-            escrowId,
-            deadline,
-            nonce,
-        );
-
-        const signature = await buyerWalletClient.signTypedData({
-            account: buyerWalletClient.account!,
-            domain: (sdk as any).getEip712Domain(),
-            types: (sdk as any).requestCancelTypes,
-            primaryType: "RequestCancel",
-            message: msg,
-        });
-
-        await sdk.requestCancelSigned(
-            buyerWalletClient,
-            escrowId,
-            signature as Hex,
-            deadline,
-            nonce,
-        );
-    }
-
-    let status = await sdk.getEscrowStatus(escrowId, true);
-    console.assert(
-        status.stateName === "AWAITING_DELIVERY",
-        "After buyer signed cancel only, still AWAITING_DELIVERY",
-    );
-
-    // Seller signed cancel
-    {
-        const deal = await sdk.getEscrowByIdParsed(escrowId);
-        const nonce = await sdk.getUserNonce(escrowId, deal.seller);
-        const deadline = await sdk.createSignatureDeadline(60);
-        const msg = await (sdk as any).buildRequestCancelMessage(
-            escrowId,
-            deadline,
-            nonce,
-        );
-
-        const signature = await sellerWalletClient.signTypedData({
-            account: sellerWalletClient.account!,
-            domain: (sdk as any).getEip712Domain(),
-            types: (sdk as any).requestCancelTypes,
-            primaryType: "RequestCancel",
-            message: msg,
-        });
-
-        await sdk.requestCancelSigned(
-            sellerWalletClient,
-            escrowId,
-            signature as Hex,
-            deadline,
-            nonce,
-        );
-    }
-
-    status = await sdk.getEscrowStatus(escrowId, true);
-    console.assert(status.stateName === "CANCELED", "Signed mutual cancel → CANCELED");
-
-    console.log("✅ TEST passed: requestCancelSigned – buyer & seller\n");
-}
-
 async function testCancelByTimeout() {
     console.log("\nTEST: cancelByTimeout – after grace period\n");
 
@@ -1365,7 +1291,7 @@ async function testCancelByTimeout() {
     await sdk.requestCancel(buyerWalletClient, escrowId);
 
     // Increase time beyond GRACE_PERIOD (from contract, e.g. 7h)
-    await increaseTime(7 * 60 * 60); // adjust if your GRACE_PERIOD differs [sec]
+    await increaseTime(72 * 60 * 60); // adjust if your GRACE_PERIOD differs [sec]
 
     // Buyer cancels by timeout
     await sdk.cancelByTimeout(buyerWalletClient, escrowId);
@@ -1551,7 +1477,7 @@ async function testSubmitArbiterDecisionCompleteAndRefunded() {
 
         const sellerBefore = await sdk.getTokenBalanceOf(seller, deal.token);
         const buyerBefore = await sdk.getTokenBalanceOf(buyer, deal.token);
-        await increaseTime(24 * 60 * 60);
+        await increaseTime(72 * 60 * 60);
 
         await sdk.submitArbiterDecision(
             arbiterWalletClient,
@@ -1601,7 +1527,7 @@ async function testSubmitArbiterDecisionCompleteAndRefunded() {
         const seller = deal.seller;
         const buyer = deal.buyer;
 
-        await increaseTime(24 * 60 * 60);
+        await increaseTime(72 * 60 * 60);
 
         const sellerBefore = await sdk.getTokenBalanceOf(seller, deal.token);
         const buyerBefore = await sdk.getTokenBalanceOf(buyer, deal.token);
@@ -1910,7 +1836,6 @@ async function run() {
     await testConfirmDeliverySigned();
     await testConfirmDeliverySignedExpiredDeadline();
     await testRequestCancelMutual();
-    await testRequestCancelSigned();
     await testCancelByTimeout();
     await testStartDispute();
     await testStartDisputeSignedRoles();

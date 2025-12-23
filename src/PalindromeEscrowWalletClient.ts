@@ -18,8 +18,45 @@ export class PalindromeEscrowWalletClient {
         this.chainId = chainId;
     }
 
-    // ----- EIP-712 typed data for ExecuteSplit -----
+    // ------- HELPERS -------
+    async getNonce(wallet: Address): Promise<bigint> {
+        return await this.publicClient.readContract({
+            address: wallet,
+            abi: this.abi,
+            functionName: 'nonce',
+            args: [],
+        }) as bigint;
+    }
 
+    async getOwners(wallet: Address): Promise<[Address, Address, Address]> {
+        const owners = await this.publicClient.readContract({
+            address: wallet,
+            abi: this.abi,
+            functionName: 'getOwners',
+            args: [],
+        }) as [Address, Address, Address];
+
+        return owners; // order: buyer, seller, arbiter
+    }
+
+    static padSignatures(sigs: Hex[]): [Hex, Hex, Hex] {
+        const padded: [Hex, Hex, Hex] = ['0x', '0x', '0x'];
+        sigs.slice(0, 3).forEach((sig, i) => {
+            padded[i] = sig;
+        });
+        return padded;
+    }
+
+    async isOwner(wallet: Address, account: Address): Promise<boolean> {
+        return await this.publicClient.readContract({
+            address: wallet,
+            abi: this.abi,
+            functionName: 'isOwner',
+            args: [account],
+        }) as boolean;
+    }
+
+    // ----- EIP-712 typed data for ExecuteSplit -----
     getExecuteSplitTypedData(params: {
         wallet: Address;
         escrowId: bigint;
@@ -90,7 +127,6 @@ export class PalindromeEscrowWalletClient {
 
 
     // ----- Execution functions -----
-
     async executeERC20Split(
         executor: WalletClient,
         wallet: Address,

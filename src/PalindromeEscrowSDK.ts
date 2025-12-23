@@ -1634,7 +1634,7 @@ export class PalindromeEscrowSDK {
         wallet,
         escrowId,
         token: deal.token as Address,
-        to: deal.buyer as Address,   // refund-to-buyer path
+        to: deal.buyer as Address,
         feeTo,
         nonce: walletNonce,
       },
@@ -1897,9 +1897,10 @@ export class PalindromeEscrowSDK {
 
   async confirmDelivery(
     walletClient: EscrowWalletClient,
-    escrowId: bigint
+    escrowId: bigint,
+    ipfsHaesh: string,
   ): Promise<Hex> {
-    return this.sendAndConfirm(walletClient, "confirmDelivery", [escrowId]);
+    return this.sendAndConfirm(walletClient, "confirmDelivery", [escrowId, ipfsHaesh || '']);
   }
 
   async confirmDeliverySigned(
@@ -1939,10 +1940,9 @@ export class PalindromeEscrowSDK {
       signature,
       deadline,
       nonce,
-      ipfsHaesh
+      ipfsHaesh || ''
     ]);
   }
-
 
   async confirmDeliverySignedAsBuyer(
     walletClient: EscrowWalletClient,
@@ -2030,48 +2030,6 @@ export class PalindromeEscrowSDK {
     escrowId: bigint
   ): Promise<Hex> {
     return this.sendAndConfirm(walletClient, "requestCancel", [escrowId]);
-  }
-
-  async requestCancelSigned(
-    walletClient: EscrowWalletClient,
-    escrowId: bigint,
-    signature: Hex,
-    deadline: bigint,
-    nonce: bigint
-  ): Promise<Hex> {
-    if (this.isSignatureDeadlineExpired(deadline)) {
-      throw new SignatureDeadlineExpiredError();
-    }
-
-    const account = this.getConnectedAccountOrThrow(walletClient);
-    const escrow = await this.getEscrowByIdParsed(escrowId);
-
-
-    if (
-      escrow.state !== EscrowState.AWAITING_PAYMENT &&
-      escrow.state !== EscrowState.AWAITING_DELIVERY
-    ) {
-      throw new InvalidStateError(
-        this.STATE_NAMES[escrow.state],
-        "AWAITING_PAYMENT or AWAITING_DELIVERY"
-      );
-    }
-
-    // Only buyer or seller can request cancel
-    const role = this.getUserRoleForEscrow(account, escrow);
-    if (role === Role.None || role === Role.Arbiter) {
-      throw new SDKError(
-        "Only buyer or seller can request cancel",
-        SDKErrorCode.INVALID_ROLE
-      );
-    }
-
-    return this.sendAndConfirm(walletClient, "requestCancelSigned", [
-      escrowId,
-      signature,
-      deadline,
-      nonce,
-    ]);
   }
 
   async startDisputeSigned(
