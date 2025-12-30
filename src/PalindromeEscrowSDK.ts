@@ -15,6 +15,7 @@
  * - confirmDeliverySigned(escrowId, coordSignature, deadline, nonce, buyerWalletSig)
  * - requestCancel(escrowId, walletSig)
  * - cancelByTimeout(escrowId)
+ * - autoRelease(escrowId)
  * - startDispute(escrowId)
  * - startDisputeSigned(escrowId, signature, deadline, nonce)
  * - submitDisputeMessage(escrowId, role, ipfsHash)
@@ -921,8 +922,27 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   /**
-   * Create escrow (called by SELLER)
-   * Contract: createEscrow(token, buyer, amount, maturityDays, arbiter, title, ipfsHash, sellerWalletSig)
+   * Create a new escrow as the seller
+   *
+   * This function creates a new escrow where the caller (seller) is offering goods/services
+   * to a buyer. The escrow starts in AWAITING_PAYMENT state until the buyer deposits funds.
+   *
+   * The seller's wallet authorization signature is automatically generated and attached,
+   * which will be used later for 2-of-3 multisig withdrawals from the escrow wallet.
+   *
+   * @param walletClient - The seller's wallet client (must have account connected)
+   * @param params - Escrow creation parameters
+   * @param params.token - ERC20 token address for payment
+   * @param params.buyer - Buyer's wallet address
+   * @param params.amount - Payment amount in token's smallest unit (e.g., wei for 18 decimals)
+   * @param params.maturityTimeDays - Optional days until maturity (default: 0, max: 3650)
+   * @param params.arbiter - Optional arbiter address for dispute resolution
+   * @param params.title - Escrow title/description (1-256 characters)
+   * @param params.ipfsHash - Optional IPFS hash for additional details
+   * @returns Object containing escrowId, transaction hash, and wallet address
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} VALIDATION_ERROR - If parameters are invalid
+   * @throws {SDKError} TRANSACTION_FAILED - If the transaction fails
    */
   async createEscrow(
     walletClient: EscrowWalletClient,
@@ -1014,8 +1034,28 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Create escrow and deposit (called by BUYER)
-   * Contract: createEscrowAndDeposit(token, seller, amount, maturityDays, arbiter, title, ipfsHash, buyerWalletSig)
+   * Create a new escrow and deposit funds as the buyer (single transaction)
+   *
+   * This function creates a new escrow and immediately deposits the payment in one transaction.
+   * The escrow starts in AWAITING_DELIVERY state. The seller must call `acceptEscrow` to
+   * provide their wallet signature before funds can be released.
+   *
+   * Token approval is automatically handled if needed.
+   *
+   * @param walletClient - The buyer's wallet client (must have account connected)
+   * @param params - Escrow creation parameters
+   * @param params.token - ERC20 token address for payment
+   * @param params.seller - Seller's wallet address
+   * @param params.amount - Payment amount in token's smallest unit (e.g., wei for 18 decimals)
+   * @param params.maturityTimeDays - Optional days until maturity (default: 0, max: 3650)
+   * @param params.arbiter - Optional arbiter address for dispute resolution
+   * @param params.title - Escrow title/description (1-256 characters)
+   * @param params.ipfsHash - Optional IPFS hash for additional details
+   * @returns Object containing escrowId, transaction hash, and wallet address
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} VALIDATION_ERROR - If parameters are invalid
+   * @throws {SDKError} INSUFFICIENT_BALANCE - If buyer has insufficient token balance
+   * @throws {SDKError} TRANSACTION_FAILED - If the transaction fails
    */
   async createEscrowAndDeposit(
     walletClient: EscrowWalletClient,
@@ -1119,8 +1159,22 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   /**
-   * Deposit funds into escrow (called by BUYER)
-   * Contract: deposit(escrowId, buyerWalletSig)
+   * Deposit funds into an existing escrow as the buyer
+   *
+   * This function is used when the seller created the escrow via `createEscrow`.
+   * The buyer deposits the required payment amount, transitioning the escrow from
+   * AWAITING_PAYMENT to AWAITING_DELIVERY state.
+   *
+   * Token approval is automatically handled if needed.
+   * The buyer's wallet authorization signature is automatically generated.
+   *
+   * @param walletClient - The buyer's wallet client (must have account connected)
+   * @param escrowId - The escrow ID to deposit into
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} NOT_BUYER - If caller is not the designated buyer
+   * @throws {SDKError} INVALID_STATE - If escrow is not in AWAITING_PAYMENT state
+   * @throws {SDKError} INSUFFICIENT_BALANCE - If buyer has insufficient token balance
    */
   async deposit(
     walletClient: EscrowWalletClient,
@@ -1177,8 +1231,21 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   /**
-   * Accept escrow (called by SELLER when buyer created the escrow)
-   * Contract: acceptEscrow(escrowId, sellerWalletSig)
+   * Accept an escrow as the seller (for buyer-created escrows)
+   *
+   * This function is required when the buyer created the escrow via `createEscrowAndDeposit`.
+   * The seller must accept to provide their wallet authorization signature, which is
+   * required for the 2-of-3 multisig withdrawal mechanism.
+   *
+   * Without accepting, the seller cannot receive funds even if the buyer confirms delivery.
+   *
+   * @param walletClient - The seller's wallet client (must have account connected)
+   * @param escrowId - The escrow ID to accept
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} NOT_SELLER - If caller is not the designated seller
+   * @throws {SDKError} INVALID_STATE - If escrow is not in AWAITING_DELIVERY state
+   * @throws {SDKError} ALREADY_ACCEPTED - If escrow was already accepted
    */
   async acceptEscrow(
     walletClient: EscrowWalletClient,
@@ -1232,8 +1299,22 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   /**
-   * Confirm delivery (called by BUYER)
-   * Contract: confirmDelivery(escrowId, buyerWalletSig)
+   * Confirm delivery and release funds to the seller
+   *
+   * This function is called by the buyer after receiving the goods/services.
+   * It transitions the escrow to COMPLETE state and authorizes payment release to the seller.
+   *
+   * After confirmation, anyone can call `withdraw` on the escrow wallet to execute
+   * the actual token transfer (requires 2-of-3 signatures: buyer + seller).
+   *
+   * A 1% fee is deducted from the payment amount.
+   *
+   * @param walletClient - The buyer's wallet client (must have account connected)
+   * @param escrowId - The escrow ID to confirm
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} NOT_BUYER - If caller is not the designated buyer
+   * @throws {SDKError} INVALID_STATE - If escrow is not in AWAITING_DELIVERY state
    */
   async confirmDelivery(
     walletClient: EscrowWalletClient,
@@ -1278,8 +1359,22 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Confirm delivery with signature (gasless for buyer, relayer pays gas)
-   * Contract: confirmDeliverySigned(escrowId, coordSignature, deadline, nonce, buyerWalletSig)
+   * Confirm delivery via meta-transaction (gasless for buyer)
+   *
+   * This function allows a relayer to submit the confirm delivery transaction on behalf
+   * of the buyer. The buyer signs the confirmation off-chain, and the relayer pays the gas.
+   *
+   * Use `prepareConfirmDeliverySigned` to generate the required signatures.
+   *
+   * @param walletClient - The relayer's wallet client (pays gas)
+   * @param escrowId - The escrow ID to confirm
+   * @param coordSignature - Buyer's EIP-712 signature for the confirmation
+   * @param deadline - Signature expiration timestamp (must be within 24 hours)
+   * @param nonce - Buyer's nonce for replay protection
+   * @param buyerWalletSig - Buyer's wallet authorization signature
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} SIGNATURE_EXPIRED - If deadline has passed
    */
   async confirmDeliverySigned(
     walletClient: EscrowWalletClient,
@@ -1310,7 +1405,19 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Helper: Buyer signs and generates all data for gasless confirm delivery
+   * Prepare signatures for gasless confirm delivery
+   *
+   * This helper function generates all the signatures needed for a gasless confirm delivery.
+   * The buyer signs off-chain, and the resulting data can be sent to a relayer who will
+   * submit the transaction and pay the gas.
+   *
+   * The deadline is set to 60 minutes from the current block timestamp.
+   *
+   * @param buyerWalletClient - The buyer's wallet client (must have account connected)
+   * @param escrowId - The escrow ID to confirm
+   * @returns Object containing coordSignature, buyerWalletSig, deadline, and nonce
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} NOT_BUYER - If caller is not the designated buyer
    */
   async prepareConfirmDeliverySigned(
     buyerWalletClient: EscrowWalletClient,
@@ -1356,10 +1463,22 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   /**
-   * Request cancellation (called by BUYER or SELLER)
-   * Contract: requestCancel(escrowId, walletSig)
-   * 
-   * If both parties request, escrow is automatically canceled.
+   * Request cancellation of an escrow
+   *
+   * This function allows either the buyer or seller to request cancellation.
+   * Both parties must call this function for a mutual cancellation to occur.
+   *
+   * - If only one party requests: The request is recorded, awaiting the other party
+   * - If both parties request: The escrow is automatically canceled and funds returned to buyer
+   *
+   * Use `getCancelRequestStatus` to check if the other party has already requested.
+   *
+   * @param walletClient - The buyer's or seller's wallet client
+   * @param escrowId - The escrow ID to cancel
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} INVALID_ROLE - If caller is not buyer or seller
+   * @throws {SDKError} INVALID_STATE - If escrow is not in AWAITING_DELIVERY state
    */
   async requestCancel(
     walletClient: EscrowWalletClient,
@@ -1405,8 +1524,22 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Cancel by timeout (called by BUYER after maturity + grace period)
-   * Contract: cancelByTimeout(escrowId)
+   * Cancel escrow by timeout (unilateral cancellation by buyer)
+   *
+   * This function allows the buyer to cancel the escrow unilaterally if:
+   * - The buyer has already requested cancellation via `requestCancel`
+   * - The maturity time + 24-hour grace period has passed
+   * - The seller has not agreed to mutual cancellation
+   * - No dispute is active
+   *
+   * Funds are returned to the buyer without any fee deduction.
+   *
+   * @param walletClient - The buyer's wallet client (must have account connected)
+   * @param escrowId - The escrow ID to cancel
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} NOT_BUYER - If caller is not the designated buyer
+   * @throws {SDKError} INVALID_STATE - If conditions for timeout cancel are not met
    */
   async cancelByTimeout(
     walletClient: EscrowWalletClient,
@@ -1435,13 +1568,115 @@ export class PalindromeEscrowSDK {
     return hash;
   }
 
+  /**
+   * Auto-release funds to seller after maturity + grace period
+   *
+   * This function allows the seller to claim funds unilaterally after the maturity time
+   * plus a 24-hour grace period has passed. This protects sellers when buyers become
+   * unresponsive after receiving goods/services.
+   *
+   * Requirements:
+   * - Escrow must be in AWAITING_DELIVERY state
+   * - No dispute has been started
+   * - Buyer has not requested cancellation
+   * - maturityTime + 24 hours (GRACE_PERIOD) has passed
+   * - Seller has already provided wallet signature (via createEscrow or acceptEscrow)
+   *
+   * A 1% fee is deducted from the payment amount.
+   *
+   * @param walletClient - The seller's wallet client (must have account connected)
+   * @param escrowId - The escrow ID to auto-release
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} NOT_SELLER - If caller is not the designated seller
+   * @throws {SDKError} INVALID_STATE - If escrow is not in AWAITING_DELIVERY state
+   * @throws {SDKError} INVALID_STATE - If dispute is active or buyer requested cancel
+   * @throws {SDKError} VALIDATION_ERROR - If seller wallet signature is missing
+   */
+  async autoRelease(
+    walletClient: EscrowWalletClient,
+    escrowId: bigint,
+  ): Promise<Hex> {
+    assertWalletClient(walletClient);
+
+    const deal = await this.getEscrowByIdParsed(escrowId);
+
+    // Verify caller is seller
+    if (!addressEquals(walletClient.account.address, deal.seller)) {
+      throw new SDKError("Only seller can auto-release", SDKErrorCode.NOT_SELLER);
+    }
+
+    // Verify state
+    if (deal.state !== EscrowState.AWAITING_DELIVERY) {
+      throw new SDKError(
+        `Invalid state: ${this.STATE_NAMES[deal.state]}. Expected: AWAITING_DELIVERY`,
+        SDKErrorCode.INVALID_STATE,
+      );
+    }
+
+    // Verify no dispute is active
+    if (deal.disputeStartTime > 0n) {
+      throw new SDKError("Cannot auto-release: dispute is active", SDKErrorCode.INVALID_STATE);
+    }
+
+    // Verify buyer hasn't requested cancellation
+    if (deal.buyerCancelRequested) {
+      throw new SDKError(
+        "Cannot auto-release: buyer has requested cancellation",
+        SDKErrorCode.INVALID_STATE,
+      );
+    }
+
+    // Verify deposit exists
+    if (deal.depositTime === 0n) {
+      throw new SDKError("Cannot auto-release: no deposit made", SDKErrorCode.INVALID_STATE);
+    }
+
+    // Verify seller signature exists
+    if (!deal.sellerWalletSig || deal.sellerWalletSig === "0x" || deal.sellerWalletSig.length !== 132) {
+      throw new SDKError(
+        "Cannot auto-release: seller wallet signature missing. Call acceptEscrow first if buyer created the escrow.",
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    // Auto-release
+    const hash = await walletClient.writeContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: "autoRelease",
+      args: [escrowId],
+      account: walletClient.account,
+      chain: this.chain,
+    });
+
+    await this.waitForReceipt(hash);
+    return hash;
+  }
+
   // ==========================================================================
   // DISPUTE FLOWS
   // ==========================================================================
 
   /**
-   * Start dispute (called by BUYER or SELLER)
-   * Contract: startDispute(escrowId)
+   * Start a dispute for an escrow
+   *
+   * This function initiates a dispute when there's a disagreement between buyer and seller.
+   * Once started, the escrow enters DISPUTED state and requires arbiter resolution.
+   *
+   * Either the buyer or seller can start a dispute. An arbiter must be assigned to the
+   * escrow for disputes to be possible.
+   *
+   * After starting a dispute:
+   * 1. Both parties should submit evidence via `submitDisputeMessage`
+   * 2. The arbiter reviews evidence and makes a decision via `submitArbiterDecision`
+   * 3. The arbiter can rule in favor of buyer (REFUNDED) or seller (COMPLETE)
+   *
+   * @param walletClient - The buyer's or seller's wallet client
+   * @param escrowId - The escrow ID to dispute
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} INVALID_STATE - If escrow is not in AWAITING_DELIVERY state
    */
   async startDispute(
     walletClient: EscrowWalletClient,
@@ -1464,8 +1699,21 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Start dispute with signature (gasless)
-   * Contract: startDisputeSigned(escrowId, signature, deadline, nonce)
+   * Start a dispute via meta-transaction (gasless for buyer/seller)
+   *
+   * This function allows a relayer to submit the start dispute transaction on behalf
+   * of the buyer or seller. The initiator signs off-chain, and the relayer pays the gas.
+   *
+   * Use `signStartDispute` to generate the required signature.
+   *
+   * @param walletClient - The relayer's wallet client (pays gas)
+   * @param escrowId - The escrow ID to dispute
+   * @param signature - Buyer's or seller's EIP-712 signature
+   * @param deadline - Signature expiration timestamp (must be within 24 hours)
+   * @param nonce - Signer's nonce for replay protection
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} SIGNATURE_EXPIRED - If deadline has passed
    */
   async startDisputeSigned(
     walletClient: EscrowWalletClient,
@@ -1495,8 +1743,24 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Submit dispute evidence (called by BUYER or SELLER)
-   * Contract: submitDisputeMessage(escrowId, role, ipfsHash)
+   * Submit evidence for a dispute
+   *
+   * This function allows the buyer or seller to submit evidence supporting their case.
+   * Each party can only submit evidence once. Evidence is stored on IPFS and the hash
+   * is recorded on-chain.
+   *
+   * The arbiter will review submitted evidence before making a decision. Both parties
+   * should submit evidence for a fair resolution. After 30 days, the arbiter can make
+   * a decision even without complete evidence.
+   *
+   * @param walletClient - The buyer's or seller's wallet client
+   * @param escrowId - The escrow ID
+   * @param role - The caller's role (Role.Buyer or Role.Seller)
+   * @param ipfsHash - IPFS hash containing the evidence (max 500 characters)
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} EVIDENCE_ALREADY_SUBMITTED - If caller already submitted evidence
+   * @throws {SDKError} INVALID_STATE - If escrow is not in DISPUTED state
    */
   async submitDisputeMessage(
     walletClient: EscrowWalletClient,
@@ -1530,8 +1794,29 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Submit arbiter decision (called by ARBITER)
-   * Contract: submitArbiterDecision(escrowId, resolution, ipfsHash, arbiterWalletSig)
+   * Submit arbiter's decision to resolve a dispute
+   *
+   * This function is called by the designated arbiter to resolve a dispute.
+   * The arbiter reviews evidence submitted by both parties and makes a final decision.
+   *
+   * The arbiter can rule:
+   * - DisputeResolution.Complete (3): Funds go to seller (with 1% fee)
+   * - DisputeResolution.Refunded (4): Funds go to buyer (no fee)
+   *
+   * Requirements:
+   * - Both parties must have submitted evidence, OR
+   * - 30 days + 1 hour timeout has passed since dispute started
+   *
+   * The arbiter's wallet signature is automatically generated for the multisig.
+   *
+   * @param walletClient - The arbiter's wallet client (must have account connected)
+   * @param escrowId - The escrow ID to resolve
+   * @param resolution - DisputeResolution.Complete or DisputeResolution.Refunded
+   * @param ipfsHash - IPFS hash containing the decision explanation
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} NOT_ARBITER - If caller is not the designated arbiter
+   * @throws {SDKError} INVALID_STATE - If escrow is not in DISPUTED state
    */
   async submitArbiterDecision(
     walletClient: EscrowWalletClient,
@@ -1574,11 +1859,24 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   /**
-   * Withdraw funds from escrow wallet (called by any participant)
-   * Contract: PalindromeEscrowWallet.withdraw()
-   * 
-   * The wallet contract reads signatures from the escrow contract
-   * and verifies 2-of-3 multisig automatically.
+   * Withdraw funds from the escrow wallet
+   *
+   * This function executes the actual token transfer from the escrow wallet to the
+   * designated recipient. The wallet contract uses a 2-of-3 multisig mechanism:
+   *
+   * - COMPLETE state: Requires buyer + seller signatures → funds go to seller
+   * - REFUNDED state: Requires buyer + arbiter signatures → funds go to buyer
+   * - CANCELED state: Requires buyer + seller signatures → funds go to buyer
+   *
+   * Anyone can call this function (typically the recipient), as the signatures
+   * were already collected during the escrow lifecycle. The wallet contract
+   * automatically reads and verifies signatures from the escrow contract.
+   *
+   * @param walletClient - Any wallet client (typically the recipient)
+   * @param escrowId - The escrow ID to withdraw from
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} INVALID_STATE - If escrow is not in a final state (COMPLETE/REFUNDED/CANCELED)
    */
   async withdraw(
     walletClient: EscrowWalletClient,
@@ -2142,6 +2440,35 @@ export class PalindromeEscrowSDK {
       default:
         return false;
     }
+  }
+
+  /**
+   * Get cancellation request status for an escrow
+   *
+   * This helper function checks whether the buyer and/or seller have requested
+   * cancellation. Use this to determine if mutual cancellation is pending or complete.
+   *
+   * Cancellation flow:
+   * - Either party calls `requestCancel` to initiate
+   * - If only one party requested, the other must also call `requestCancel` for mutual cancel
+   * - When both request, the escrow is automatically canceled and funds return to buyer
+   * - Alternatively, buyer can use `cancelByTimeout` after maturity + grace period
+   *
+   * @param escrowId - The escrow ID to check
+   * @returns Object with buyer/seller cancel request status and whether mutual cancel is complete
+   */
+  async getCancelRequestStatus(escrowId: bigint): Promise<{
+    buyerRequested: boolean;
+    sellerRequested: boolean;
+    mutualCancelComplete: boolean;
+  }> {
+    const deal = await this.getEscrowByIdParsed(escrowId);
+
+    return {
+      buyerRequested: deal.buyerCancelRequested,
+      sellerRequested: deal.sellerCancelRequested,
+      mutualCancelComplete: deal.buyerCancelRequested && deal.sellerCancelRequested,
+    };
   }
 
   /**
