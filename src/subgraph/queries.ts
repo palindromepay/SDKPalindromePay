@@ -13,18 +13,24 @@ export const ALL_ESCROWS_QUERY = gql`
       buyer
       seller
       arbiter
+      wallet
       amount
       maturityTime
       depositTime
       state
       title
       ipfsHash
-      ipfsHaesh
       sellerWalletSig
+      buyerWalletSig
+      arbiterWalletSig
+      sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
+      fee
+      disputeStartTime
+      disputeLongDeadline
       disputeStatus
       disputeMessages {
         id
@@ -33,6 +39,7 @@ export const ALL_ESCROWS_QUERY = gql`
         sender
         ipfsHash
         timestamp
+        txHash
       }
     }
   }
@@ -48,18 +55,24 @@ export const ESCROWS_BY_BUYER_QUERY = gql`
       arbiter
       buyer
       seller
+      wallet
       amount
       maturityTime
       depositTime
       state
       title
       ipfsHash
-      ipfsHaesh
       sellerWalletSig
+      buyerWalletSig
+      arbiterWalletSig
+      sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
+      fee
+      disputeStartTime
+      disputeLongDeadline
       disputeStatus
       disputeMessages {
         id
@@ -68,6 +81,7 @@ export const ESCROWS_BY_BUYER_QUERY = gql`
         sender
         ipfsHash
         timestamp
+        txHash
       }
     }
   }
@@ -83,18 +97,24 @@ export const ESCROWS_BY_SELLER_QUERY = gql`
       arbiter
       buyer
       seller
+      wallet
       amount
       maturityTime
       depositTime
       state
       title
       ipfsHash
-      ipfsHaesh
       sellerWalletSig
+      buyerWalletSig
+      arbiterWalletSig
+      sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
+      fee
+      disputeStartTime
+      disputeLongDeadline
       disputeStatus
       disputeMessages {
         id
@@ -103,6 +123,7 @@ export const ESCROWS_BY_SELLER_QUERY = gql`
         sender
         ipfsHash
         timestamp
+        txHash
       }
     }
   }
@@ -113,22 +134,29 @@ export const ESCROW_DETAIL_QUERY = gql`
   query EscrowDetail($id: ID!) {
     escrow(id: $id) {
       id
+      txUrl
       token
       buyer
       seller
       arbiter
+      wallet
       amount
       maturityTime
       depositTime
       state
       title
       ipfsHash
-      ipfsHaesh
       sellerWalletSig
+      buyerWalletSig
+      arbiterWalletSig
+      sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
+      fee
+      disputeStartTime
+      disputeLongDeadline
       disputeStatus
       disputeMessages {
         id
@@ -136,7 +164,6 @@ export const ESCROW_DETAIL_QUERY = gql`
         roleValue
         sender
         ipfsHash
-        disputeStatus
         timestamp
         txHash
       }
@@ -145,6 +172,7 @@ export const ESCROW_DETAIL_QUERY = gql`
         type
         sender
         amount
+        fee
         state
         timestamp
         details
@@ -186,15 +214,21 @@ export const ALL_DISPUTED_ESCROWS_QUERY = gql`
       arbiter
       buyer
       seller
+      wallet
       amount
       depositTime
       state
       title
       ipfsHash
-      ipfsHaesh
       sellerWalletSig
+      buyerWalletSig
+      arbiterWalletSig
+      sellerAccepted
       createdAt
       updatedAt
+      fee
+      disputeStartTime
+      disputeLongDeadline
       disputeStatus
       disputeMessages {
         id
@@ -219,17 +253,23 @@ export const ESCROW_WITH_DISPUTE_DETAILS_QUERY = gql`
       arbiter
       buyer
       seller
+      wallet
       amount
       depositTime
       state
       title
       ipfsHash
-      ipfsHaesh
       sellerWalletSig
+      buyerWalletSig
+      arbiterWalletSig
+      sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
+      fee
+      disputeStartTime
+      disputeLongDeadline
       disputeStatus
       disputeMessages {
         id
@@ -237,7 +277,6 @@ export const ESCROW_WITH_DISPUTE_DETAILS_QUERY = gql`
         roleValue
         sender
         ipfsHash
-        disputeStatus
         timestamp
         txHash
       }
@@ -246,6 +285,7 @@ export const ESCROW_WITH_DISPUTE_DETAILS_QUERY = gql`
         type
         sender
         amount
+        fee
         state
         timestamp
         details
@@ -262,16 +302,23 @@ export const DISPUTED_ESCROWS_BY_BUYER_QUERY = gql`
       txUrl
       seller
       arbiter
+      wallet
       amount
       title
       ipfsHash
       createdAt
+      fee
+      disputeStartTime
+      disputeLongDeadline
       disputeStatus
       disputeMessages {
+        id
         role
+        roleValue
         sender
         ipfsHash
         timestamp
+        txHash
       }
     }
   }
@@ -284,16 +331,23 @@ export const DISPUTED_ESCROWS_BY_SELLER_QUERY = gql`
       txUrl
       buyer
       arbiter
+      wallet
       amount
       title
       ipfsHash
       createdAt
+      fee
+      disputeStartTime
+      disputeLongDeadline
       disputeStatus
       disputeMessages {
+        id
         role
+        roleValue
         sender
         ipfsHash
         timestamp
+        txHash
       }
     }
   }
@@ -307,17 +361,23 @@ export const ESCROWS_PENDING_ARBITER_REVIEW_QUERY = gql`
       txUrl
       buyer
       seller
+      wallet
       amount
       title
       ipfsHash
       createdAt
+      fee
+      disputeStartTime
+      disputeLongDeadline
       disputeStatus
       disputeMessages {
         id
         role
+        roleValue
         sender
         ipfsHash
         timestamp
+        txHash
       }
     }
   }
@@ -328,6 +388,8 @@ export const DISPUTE_MESSAGES_BY_ROLE_QUERY = gql`
   query DisputeMessagesByRole($escrowId: ID!, $role: String!) {
     disputeMessages(where: { escrow: $escrowId, role: $role }) {
       id
+      role
+      roleValue
       sender
       ipfsHash
       timestamp
@@ -353,6 +415,7 @@ export const RECENT_DISPUTE_ACTIVITY_QUERY = gql`
         title
       }
       role
+      roleValue
       sender
       ipfsHash
       timestamp
@@ -367,7 +430,9 @@ export const HAS_SUBMITTED_EVIDENCE_QUERY = gql`
     disputeMessages(where: { escrow: $escrowId, sender: $sender }) {
       id
       role
+      roleValue
       timestamp
+      txHash
     }
   }
 `;
@@ -378,9 +443,14 @@ export const DISPUTE_SUBMISSION_STATUS_QUERY = gql`
     escrow(id: $escrowId) {
       id
       disputeStatus
+      disputeStartTime
+      disputeLongDeadline
       disputeMessages {
+        id
         role
         roleValue
+        sender
+        timestamp
       }
     }
   }
@@ -392,11 +462,15 @@ export const DISPUTED_ESCROW_EVENTS_QUERY = gql`
     escrow(id: $escrowId) {
       id
       state
+      disputeStatus
+      disputeStartTime
+      disputeLongDeadline
       events(orderBy: timestamp, orderDirection: asc) {
         id
         type
         sender
         amount
+        fee
         state
         timestamp
         details

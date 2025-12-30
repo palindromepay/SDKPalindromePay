@@ -4,6 +4,19 @@
   "sourceName": "contracts/PalindromeEscrowWallet.sol",
   "abi": [
     {
+      "inputs": [],
+      "name": "feeReceiver",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
       "inputs": [
         {
           "internalType": "uint256",
@@ -79,6 +92,21 @@
               "internalType": "uint8",
               "name": "tokenDecimals",
               "type": "uint8"
+            },
+            {
+              "internalType": "bytes",
+              "name": "sellerWalletSig",
+              "type": "bytes"
+            },
+            {
+              "internalType": "bytes",
+              "name": "buyerWalletSig",
+              "type": "bytes"
+            },
+            {
+              "internalType": "bytes",
+              "name": "arbiterWalletSig",
+              "type": "bytes"
             }
           ],
           "internalType": "struct IPalindromeCryptoEscrow.EscrowDeal",
@@ -96,5 +124,5 @@
   "deployedLinkReferences": {},
   "immutableReferences": {},
   "inputSourceName": "project/contracts/PalindromeEscrowWallet.sol",
-  "buildInfoId": "solc-0_8_29-19b3d24b26b2169a8f75b3955514f791fa231062"
+  "buildInfoId": "solc-0_8_29-3a3768e8e6625866d5f06460e7957ed6c625c33b"
 }

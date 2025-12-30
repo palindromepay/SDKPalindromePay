@@ -1,0 +1,16 @@
+{
+  "functions": {
+    "api/siwe-nonce.ts": {
+      "rateLimit": {
+        "requests": 10,
+        "duration": "1m"
+      }
+    },
+    "api/dispute.ts": {
+      "rateLimit": {
+        "requests": 5,
+        "duration": "1m"
+      }
+    }
+  }
+}
