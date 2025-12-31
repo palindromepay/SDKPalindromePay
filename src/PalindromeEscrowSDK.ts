@@ -40,12 +40,13 @@ import {
   toBytes,
   encodeAbiParameters,
   getAddress,
+  zeroAddress,
 } from "viem";
-import { readContract } from "viem/actions";
+import { readContract, multicall } from "viem/actions";
 import PalindromeCryptoEscrowABI from "./contract/PalindromeCryptoEscrow.json";
 import PalindromeEscrowWalletABI from "./contract/PalindromeEscrowWallet.json";
 import ERC20ABI from "./contract/USDT.json";
-import { ApolloClient, InMemoryCache, HttpLink, NormalizedCacheObject } from "@apollo/client";
+import { ApolloClient, InMemoryCache, HttpLink } from "@apollo/client";
 import {
   ALL_ESCROWS_QUERY,
   DISPUTE_MESSAGES_BY_ESCROW_QUERY,
@@ -140,6 +141,17 @@ export interface PalindromeEscrowSDKConfig {
   /** Transaction receipt timeout in milliseconds (default: 60000) */
   receiptTimeout?: number;
   subgraphUrl?: string;
+  /**
+   * Skip eth_call simulation before sending transactions (default: false)
+   * Enable this for chains with unreliable RPC simulation (e.g., Base Sepolia)
+   * When true, transactions are sent directly without pre-flight simulation
+   */
+  skipSimulation?: boolean;
+  /**
+   * Default gas limit when simulation is skipped (default: 500000n)
+   * Only used when skipSimulation is true
+   */
+  defaultGasLimit?: bigint;
 }
 
 export interface CreateEscrowParams {
@@ -234,16 +246,16 @@ function validateAddress(address: string, fieldName: string = "address"): Addres
  * Check if address is the zero address
  */
 function isZeroAddress(address: Address): boolean {
-  return address === "0x0000000000000000000000000000000000000000";
+  return address === zeroAddress;
 }
 
 /**
  * Validate signature format (65 bytes = 130 hex chars + 0x prefix)
  */
 function validateSignature(signature: Hex, context: string = "signature"): void {
-  if (!signature.startsWith("0x") || signature.length !== 132) {
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) {
     throw new SDKError(
-      `Invalid ${context} format: expected 65-byte signature`,
+      `Invalid ${context} format: expected 65-byte hex signature`,
       SDKErrorCode.VALIDATION_ERROR,
     );
   }
@@ -282,11 +294,16 @@ export class PalindromeEscrowSDK {
   private readonly retryDelay: number;
   private readonly gasBuffer: number;
   private readonly receiptTimeout: number;
+  private readonly skipSimulation: boolean;
+  private readonly defaultGasLimit: bigint;
 
   /** LRU cache for escrow data with automatic eviction */
   private escrowCache: Map<string, { data: any; timestamp: number }> = new Map();
   /** Cache for token decimals (rarely changes, no eviction needed) */
   private tokenDecimalsCache: Map<Address, number> = new Map();
+  /** Cache for immutable contract values */
+  private walletBytecodeHashCache: Hex | null = null;
+  private feeReceiverCache: Address | null = null;
 
   private readonly STATE_NAMES = [
     "AWAITING_PAYMENT",
@@ -316,6 +333,8 @@ export class PalindromeEscrowSDK {
     this.retryDelay = config.retryDelay ?? 1000;
     this.gasBuffer = config.gasBuffer ?? 20;
     this.receiptTimeout = config.receiptTimeout ?? 60000;
+    this.skipSimulation = config.skipSimulation ?? false;
+    this.defaultGasLimit = config.defaultGasLimit ?? 500000n;
 
     this.apollo = config.apolloClient ?? new ApolloClient({
       link: new HttpLink({
@@ -330,14 +349,104 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   /**
+   * Execute a contract write with resilient simulation handling.
+   *
+   * This method handles unreliable RPC simulation on certain chains (e.g., Base Sepolia)
+   * by falling back to direct transaction sending when simulation fails.
+   *
+   * @param walletClient - The wallet client to use
+   * @param params - Contract call parameters
+   * @param params.address - Contract address
+   * @param params.abi - Contract ABI
+   * @param params.functionName - Function to call
+   * @param params.args - Function arguments
+   * @returns Transaction hash
+   */
+  private async resilientWriteContract(
+    walletClient: EscrowWalletClient,
+    params: {
+      address: Address;
+      abi: Abi;
+      functionName: string;
+      args: readonly unknown[];
+    },
+  ): Promise<Hex> {
+    const { address, abi, functionName, args } = params;
+
+    // If skipSimulation is enabled, send transaction directly
+    if (this.skipSimulation) {
+      const data = encodeFunctionData({ abi, functionName, args });
+      return walletClient.sendTransaction({
+        to: address,
+        data,
+        account: walletClient.account,
+        chain: this.chain,
+        gas: this.defaultGasLimit,
+      });
+    }
+
+    // Try standard writeContract (which includes simulation)
+    try {
+      return await walletClient.writeContract({
+        address,
+        abi,
+        functionName,
+        args,
+        account: walletClient.account,
+        chain: this.chain,
+      });
+    } catch (error: any) {
+      // Check if this is a simulation failure (not a user rejection or validation error)
+      const isSimulationError =
+        error?.message?.includes("simulation") ||
+        error?.message?.includes("eth_call") ||
+        error?.message?.includes("execution reverted") ||
+        error?.cause?.message?.includes("simulation");
+
+      const isUserRejection = error?.code === 4001;
+
+      // If it's a user rejection or not a simulation error, rethrow
+      if (isUserRejection || !isSimulationError) {
+        throw error;
+      }
+
+      // Fallback: bypass simulation and send transaction directly
+      console.warn(
+        `[PalindromeSDK] Simulation failed for ${functionName}, bypassing to send directly:`,
+        error?.message?.slice(0, 100),
+      );
+
+      const data = encodeFunctionData({ abi, functionName, args });
+      return walletClient.sendTransaction({
+        to: address,
+        data,
+        account: walletClient.account,
+        chain: this.chain,
+        gas: this.defaultGasLimit,
+      });
+    }
+  }
+
+  /**
    * Wait for transaction receipt with timeout and retry logic.
    */
   private async waitForReceipt(hash: Hex): Promise<any> {
     return this.withRetry(async () => {
-      return this.publicClient.waitForTransactionReceipt({
-        hash,
-        timeout: this.receiptTimeout,
-      });
+      try {
+        return await this.publicClient.waitForTransactionReceipt({
+          hash,
+          timeout: this.receiptTimeout,
+        });
+      } catch (error: any) {
+        if (error?.message?.includes("timed out") || error?.message?.includes("timeout")) {
+          throw new SDKError(
+            `Transaction receipt timeout after ${this.receiptTimeout}ms`,
+            SDKErrorCode.TRANSACTION_FAILED,
+            { hash },
+          );
+        }
+        throw error;
+      }
     }, "waitForTransactionReceipt");
   }
 
@@ -606,12 +715,14 @@ export class PalindromeEscrowSDK {
   async predictWalletAddress(escrowId: bigint): Promise<Address> {
     const salt = keccak256(pad(toBytes(escrowId), { size: 32 }));
 
-    // Get wallet bytecode hash from contract
-    const walletBytecodeHash = await this.publicClient.readContract({
-      address: this.contractAddress,
-      abi: this.abiEscrow,
-      functionName: "WALLET_BYTECODE_HASH",
-    }) as Hex;
+    // Get wallet bytecode hash from contract (cached - immutable value)
+    if (!this.walletBytecodeHashCache) {
+      this.walletBytecodeHashCache = await this.publicClient.readContract({
+        address: this.contractAddress,
+        abi: this.abiEscrow,
+        functionName: "WALLET_BYTECODE_HASH",
+      }) as Hex;
+    }
 
     // Compute CREATE2 address
     const encodedArgs = encodeAbiParameters(
@@ -791,19 +902,35 @@ export class PalindromeEscrowSDK {
       return [];
     }
 
-    const nonces: bigint[] = [];
-    let wordIndex = 0n;
+    // Estimate how many words we might need (count / 256 + buffer)
+    const estimatedWords = Math.min(
+      Math.ceil(count / 128) + 1, // Conservative estimate with buffer
+      Number(PalindromeEscrowSDK.MAX_NONCE_WORDS),
+    );
 
-    while (nonces.length < count && wordIndex < PalindromeEscrowSDK.MAX_NONCE_WORDS) {
-      const bitmap = await this.getNonceBitmap(escrowId, signer, wordIndex);
+    // Batch fetch multiple bitmap words at once using multicall
+    const bitmapResults = await multicall(this.publicClient, {
+      contracts: Array.from({ length: estimatedWords }, (_, i) => ({
+        address: this.contractAddress,
+        abi: this.abiEscrow,
+        functionName: "getNonceBitmap",
+        args: [escrowId, signer, BigInt(i)],
+      })),
+    });
+
+    const nonces: bigint[] = [];
+
+    for (let wordIndex = 0; wordIndex < bitmapResults.length && nonces.length < count; wordIndex++) {
+      const result = bitmapResults[wordIndex];
+      if (result.status !== "success") continue;
+
+      const bitmap = result.result as bigint;
 
       for (let i = 0n; i < 256n && nonces.length < count; i++) {
         if ((bitmap & (1n << i)) === 0n) {
-          nonces.push(wordIndex * 256n + i);
+          nonces.push(BigInt(wordIndex) * 256n + i);
         }
       }
-
-      wordIndex++;
     }
 
     if (nonces.length < count) {
@@ -904,13 +1031,11 @@ export class PalindromeEscrowSDK {
 
     if (currentAllowance >= amount) return null;
 
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: token,
       abi: this.abiERC20,
       functionName: "approve",
       args: [spender, amount],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -955,7 +1080,7 @@ export class PalindromeEscrowSDK {
     const buyer = validateAddress(params.buyer, "buyer");
     const arbiter = params.arbiter
       ? validateAddress(params.arbiter, "arbiter")
-      : "0x0000000000000000000000000000000000000000" as Address;
+      : zeroAddress;
 
     // Validate amount
     if (params.amount <= 0n) {
@@ -996,7 +1121,7 @@ export class PalindromeEscrowSDK {
     );
 
     // Create escrow
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "createEscrow",
@@ -1010,8 +1135,6 @@ export class PalindromeEscrowSDK {
         ipfsHash,
         sellerWalletSig,
       ],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     const receipt = await this.waitForReceipt(hash);
@@ -1068,7 +1191,7 @@ export class PalindromeEscrowSDK {
     const seller = validateAddress(params.seller, "seller");
     const arbiter = params.arbiter
       ? validateAddress(params.arbiter, "arbiter")
-      : "0x0000000000000000000000000000000000000000" as Address;
+      : zeroAddress;
 
     // Validate amount
     if (params.amount <= 0n) {
@@ -1117,7 +1240,7 @@ export class PalindromeEscrowSDK {
     );
 
     // Create escrow and deposit
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "createEscrowAndDeposit",
@@ -1131,8 +1254,6 @@ export class PalindromeEscrowSDK {
         ipfsHash,
         buyerWalletSig,
       ],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     const receipt = await this.waitForReceipt(hash);
@@ -1213,13 +1334,11 @@ export class PalindromeEscrowSDK {
     );
 
     // Deposit
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "deposit",
       args: [escrowId, buyerWalletSig],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1281,13 +1400,11 @@ export class PalindromeEscrowSDK {
     );
 
     // Accept escrow
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "acceptEscrow",
       args: [escrowId, sellerWalletSig],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1345,13 +1462,11 @@ export class PalindromeEscrowSDK {
     );
 
     // Confirm delivery
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "confirmDelivery",
       args: [escrowId, buyerWalletSig],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1391,13 +1506,11 @@ export class PalindromeEscrowSDK {
     }
 
     // Anyone can submit (typically relayer)
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "confirmDeliverySigned",
       args: [escrowId, coordSignature, deadline, nonce, buyerWalletSig],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1437,23 +1550,17 @@ export class PalindromeEscrowSDK {
       throw new SDKError("Only buyer can sign", SDKErrorCode.NOT_BUYER);
     }
 
-    const deadline = await this.createSignatureDeadline(60); // 60 minutes
-    const nonce = await this.getUserNonce(escrowId, buyerWalletClient.account.address);
+    // Parallelize deadline and nonce fetching
+    const [deadline, nonce] = await Promise.all([
+      this.createSignatureDeadline(60), // 60 minutes
+      this.getUserNonce(escrowId, buyerWalletClient.account.address),
+    ]);
 
-    // Sign coordinator message
-    const coordSignature = await this.signConfirmDelivery(
-      buyerWalletClient,
-      escrowId,
-      deadline,
-      nonce,
-    );
-
-    // Sign wallet authorization
-    const buyerWalletSig = await this.signWalletAuthorization(
-      buyerWalletClient,
-      deal.wallet,
-      escrowId,
-    );
+    // Sign coordinator message and wallet authorization in parallel
+    const [coordSignature, buyerWalletSig] = await Promise.all([
+      this.signConfirmDelivery(buyerWalletClient, escrowId, deadline, nonce),
+      this.signWalletAuthorization(buyerWalletClient, deal.wallet, escrowId),
+    ]);
 
     return { coordSignature, buyerWalletSig, deadline, nonce };
   }
@@ -1510,13 +1617,11 @@ export class PalindromeEscrowSDK {
     );
 
     // Request cancel
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "requestCancel",
       args: [escrowId, walletSig],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1555,13 +1660,11 @@ export class PalindromeEscrowSDK {
     }
 
     // Cancel by timeout
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "cancelByTimeout",
       args: [escrowId],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1641,13 +1744,11 @@ export class PalindromeEscrowSDK {
     }
 
     // Auto-release
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "autoRelease",
       args: [escrowId],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1685,13 +1786,11 @@ export class PalindromeEscrowSDK {
     assertWalletClient(walletClient);
 
     // Start dispute
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "startDispute",
       args: [escrowId],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1729,13 +1828,11 @@ export class PalindromeEscrowSDK {
     }
 
     // Anyone can submit (typically relayer)
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "startDisputeSigned",
       args: [escrowId, signature, deadline, nonce],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1780,13 +1877,11 @@ export class PalindromeEscrowSDK {
     }
 
     // Submit dispute message
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "submitDisputeMessage",
       args: [escrowId, role, ipfsHash],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1841,13 +1936,11 @@ export class PalindromeEscrowSDK {
     );
 
     // Submit decision
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "submitArbiterDecision",
       args: [escrowId, resolution, ipfsHash, arbiterWalletSig],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -1895,13 +1988,11 @@ export class PalindromeEscrowSDK {
     }
 
     // Withdraw from wallet
-    const hash = await walletClient.writeContract({
+    const hash = await this.resilientWriteContract(walletClient, {
       address: deal.wallet,
       abi: this.abiWallet,
       functionName: "withdraw",
       args: [],
-      account: walletClient.account,
-      chain: this.chain,
     });
 
     await this.waitForReceipt(hash);
@@ -2344,6 +2435,9 @@ export class PalindromeEscrowSDK {
   clearAllCaches(): void {
     this.escrowCache.clear();
     this.tokenDecimalsCache.clear();
+    this.feeReceiverCache = null;
+    this.cachedFeeBps = null;
+    // Note: walletBytecodeHashCache is immutable and never needs clearing
   }
 
   /**
@@ -2550,14 +2644,21 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Get fee receiver address
+   * Get fee receiver address (cached - rarely changes)
+   * @param forceRefresh - Set to true to bypass cache and fetch fresh value
    */
-  async getFeeReceiver(): Promise<Address> {
-    return this.publicClient.readContract({
+  async getFeeReceiver(forceRefresh = false): Promise<Address> {
+    if (!forceRefresh && this.feeReceiverCache) {
+      return this.feeReceiverCache;
+    }
+
+    this.feeReceiverCache = await this.publicClient.readContract({
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "feeReceiver",
-    }) as Promise<Address>;
+    }) as Address;
+
+    return this.feeReceiverCache;
   }
 
   /** Cached fee basis points (lazily computed from contract) */
