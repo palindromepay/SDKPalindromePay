@@ -298,11 +298,11 @@ async function testRole_OnlyBuyerCanConfirmDelivery() {
 async function testRole_OnlyBuyerCanCancelByTimeout() {
     section("Role: Only buyer can cancel by timeout");
 
-    const escrowId = await createDepositedEscrow(0n);
+    const escrowId = await createDepositedEscrow(1n); // Minimum 1 day required
     await sdk.requestCancel(buyerWalletClient, escrowId);
 
-    const GRACE_PERIOD = 24 * 60 * 60;
-    await increaseTime(GRACE_PERIOD + 100);
+    // Wait for maturity time to pass (1+ days)
+    await increaseTime(1 * 24 * 60 * 60 + 100);
 
     log("Seller trying to cancel by timeout...");
     try {
@@ -865,10 +865,10 @@ async function testAccept_OnlyForBuyerCreatedEscrows() {
 // CANCEL SECURITY TESTS
 // ════════════════════════════════════════════════════════════════════════════
 
-async function testCancel_TimeoutRequiresGracePeriod() {
-    section("Cancel: Timeout requires grace period");
+async function testCancel_TimeoutRequiresMaturity() {
+    section("Cancel: Timeout requires maturity time");
 
-    const escrowId = await createDepositedEscrow(0n); // 0 maturity days
+    const escrowId = await createDepositedEscrow(1n); // Minimum 1 day required
     await sdk.requestCancel(buyerWalletClient, escrowId);
 
     log("Trying immediate timeout cancel...");
@@ -876,18 +876,17 @@ async function testCancel_TimeoutRequiresGracePeriod() {
         await sdk.cancelByTimeout(buyerWalletClient, escrowId);
         assert.fail("Should have reverted");
     } catch (e: any) {
-        log("   ✅ Immediate cancel rejected (grace period active)");
+        log("   ✅ Immediate cancel rejected (maturity not reached)");
     }
 
-    // Wait for grace period
-    const GRACE_PERIOD = 24 * 60 * 60;
-    await increaseTime(GRACE_PERIOD + 100);
-    log("Waited for grace period...");
+    // Wait for maturity time to pass (1+ days)
+    await increaseTime(1 * 24 * 60 * 60 + 100);
+    log("Waited for maturity time...");
 
     await sdk.cancelByTimeout(buyerWalletClient, escrowId);
-    log("   ✅ Cancel succeeded after grace period");
+    log("   ✅ Cancel succeeded after maturity");
 
-    pass("Cancel: Timeout requires grace period");
+    pass("Cancel: Timeout requires maturity time");
 }
 
 async function testCancel_MutualCancelWorks() {
@@ -993,7 +992,7 @@ async function testNonce_GetMultipleNonces() {
     // All nonces should be unique
     const uniqueNonces = new Set(nonces.map(n => n.toString()));
     assert.equal(uniqueNonces.size, 5, "All nonces should be unique");
-    log("   ✅ Retrieved 5 unique nonces");
+    log("   ✅ Retrieved 5 unique nonces (using fallback for local Hardhat)");
 
     pass("Nonce: getMultipleNonces batch retrieval");
 }
@@ -1051,7 +1050,7 @@ async function run() {
         testAccept_OnlyForBuyerCreatedEscrows,
 
         // Cancel Security (2 tests)
-        testCancel_TimeoutRequiresGracePeriod,
+        testCancel_TimeoutRequiresMaturity,
         testCancel_MutualCancelWorks,
 
         // Signature Security (1 test)
@@ -1123,7 +1122,7 @@ async function run() {
     console.log("    • Only needed for buyer-created escrows");
     console.log("");
     console.log("  CANCEL SECURITY (2 tests):");
-    console.log("    • Timeout requires grace period");
+    console.log("    • Timeout requires maturity time");
     console.log("    • Mutual cancel works immediately");
     console.log("");
     console.log("  SIGNATURE SECURITY (1 test):");
@@ -1133,7 +1132,7 @@ async function run() {
     console.log("    • getNonceBitmap from contract");
     console.log("    • getUserNonce finds first available");
     console.log("    • isNonceUsed checks contract bitmap");
-    console.log("    • getMultipleNonces batch retrieval");
+    console.log("    • getMultipleNonces batch retrieval (with Hardhat fallback)");
     console.log("");
     console.log("═══════════════════════════════════════════════════════════════════════");
 

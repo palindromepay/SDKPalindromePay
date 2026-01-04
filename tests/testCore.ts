@@ -333,7 +333,7 @@ async function testScenario2_TimeoutRefund() {
     section("Scenario 2: Timeout Refund");
     log("Flow: Deposit → Request cancel → Wait timeout → Buyer refunded");
 
-    const escrowId = await createTestEscrow(0n);
+    const escrowId = await createTestEscrow(1n); // Minimum 1 day required
     log(`   Escrow ID: ${escrowId}`);
 
     await sdk.deposit(buyerWalletClient, escrowId);
@@ -345,9 +345,8 @@ async function testScenario2_TimeoutRefund() {
     assert.equal(deal.buyerCancelRequested, true, "Buyer cancel should be requested");
     assert.equal(deal.state, EscrowState.AWAITING_DELIVERY, "Should still be AWAITING_DELIVERY");
 
-    log("Waiting for grace period (24+ hours)...");
-    const GRACE_PERIOD = 24 * 60 * 60;
-    await increaseTime(GRACE_PERIOD + 100);
+    log("Waiting for maturity time to pass (1+ days)...");
+    await increaseTime(1 * 24 * 60 * 60 + 100); // 1 day + buffer
 
     log("Buyer canceling by timeout...");
     await sdk.cancelByTimeout(buyerWalletClient, escrowId);
@@ -789,10 +788,10 @@ async function testView_DisputeStatus() {
 // ════════════════════════════════════════════════════════════════════════════
 
 async function testEdge_MaxTitleLength() {
-    section("EDGE: Maximum length title (100 chars)");
+    section("EDGE: Maximum length title (500 chars)");
 
     await fundAccount(buyerAccount.address);
-    const maxTitle = "A".repeat(100);
+    const maxTitle = "A".repeat(500);
 
     const { escrowId } = await sdk.createEscrow(sellerWalletClient, {
         token: USDT,
@@ -805,16 +804,16 @@ async function testEdge_MaxTitleLength() {
     });
 
     assert.ok(escrowId >= 0n);
-    log("   ✅ 100-char title accepted");
+    log("   ✅ 500-char title accepted");
 
     pass("EDGE: Max title length");
 }
 
 async function testEdge_OverLengthTitle() {
-    section("EDGE: Over-length title (101 chars) rejected");
+    section("EDGE: Over-length title (501 chars) rejected");
 
     await fundAccount(buyerAccount.address);
-    const overTitle = "A".repeat(101);
+    const overTitle = "A".repeat(501);
 
     try {
         await sdk.createEscrow(sellerWalletClient, {
@@ -828,7 +827,7 @@ async function testEdge_OverLengthTitle() {
         });
         assert.fail("Should have reverted");
     } catch (e: any) {
-        log("   ✅ 101-char title rejected");
+        log("   ✅ 501-char title rejected");
     }
 
     pass("EDGE: Over-length title rejected");

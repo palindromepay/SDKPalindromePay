@@ -47,6 +47,92 @@ import PalindromeCryptoEscrowABI from "./contract/PalindromeCryptoEscrow.json";
 import PalindromeEscrowWalletABI from "./contract/PalindromeEscrowWallet.json";
 import ERC20ABI from "./contract/USDT.json";
 import { ApolloClient, InMemoryCache, HttpLink } from "@apollo/client";
+
+// ==========================================================================
+// ERROR TYPES
+// ==========================================================================
+
+export type ViemError = {
+  message: string;
+  shortMessage?: string;
+  cause?: {
+    reason?: string;
+    message?: string;
+  };
+  code?: number;
+  stack?: string;
+};
+
+export type ContractError = ViemError & {
+  contractAddress?: Address;
+  functionName?: string;
+  args?: readonly unknown[];
+};
+
+export type RPCError = {
+  message: string;
+  code?: number;
+  data?: unknown;
+};
+
+export type UnknownError = {
+  message?: string;
+  toString(): string;
+};
+
+/** Type guard to check if error is a Viem error */
+function isViemError(error: unknown): error is ViemError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'message' in error &&
+    typeof (error as any).message === 'string'
+  );
+}
+
+/** Type guard to check if error is a contract error */
+function isContractError(error: unknown): error is ContractError {
+  return isViemError(error) && 'contractAddress' in error;
+}
+
+/** Type guard to check if error has a short message */
+function hasShortMessage(error: unknown): error is ViemError & { shortMessage: string } {
+  return isViemError(error) && 'shortMessage' in error && typeof (error as any).shortMessage === 'string';
+}
+
+// ==========================================================================
+// LOGGER TYPES
+// ==========================================================================
+
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'none';
+
+export interface SDKLogger {
+  debug(message: string, context?: any): void;
+  info(message: string, context?: any): void;
+  warn(message: string, context?: any): void;
+  error(message: string, context?: any): void;
+}
+
+/** Default console logger */
+const defaultLogger: SDKLogger = {
+  debug: (msg, ctx) => ctx !== undefined ? console.debug(msg, ctx) : console.debug(msg),
+  info: (msg, ctx) => ctx !== undefined ? console.info(msg, ctx) : console.info(msg),
+  warn: (msg, ctx) => ctx !== undefined ? console.warn(msg, ctx) : console.warn(msg),
+  error: (msg, ctx) => ctx !== undefined ? console.error(msg, ctx) : console.error(msg),
+};
+
+/** No-op logger (disables all logging) */
+const noOpLogger: SDKLogger = {
+  debug: () => {},
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+};
+
+// ==========================================================================
+// IMPORTS CONTINUED
+// ==========================================================================
+
 import {
   ALL_ESCROWS_QUERY,
   DISPUTE_MESSAGES_BY_ESCROW_QUERY,
@@ -106,9 +192,13 @@ export type EscrowWalletClient = WalletClient<Transport, Chain, Account>;
 
 export class SDKError extends Error {
   code: SDKErrorCode;
-  details?: any;
+  details?: ViemError | RPCError | UnknownError | Record<string, unknown>;
 
-  constructor(message: string, code: SDKErrorCode, details?: any) {
+  constructor(
+    message: string,
+    code: SDKErrorCode,
+    details?: ViemError | RPCError | UnknownError | Record<string, unknown>
+  ) {
     super(message);
     this.code = code;
     this.details = details;
@@ -152,6 +242,16 @@ export interface PalindromeEscrowSDKConfig {
    * Only used when skipSimulation is true
    */
   defaultGasLimit?: bigint;
+  /**
+   * Logger instance for SDK events and errors (default: console)
+   * Set to custom logger or use noOpLogger to disable
+   */
+  logger?: SDKLogger;
+  /**
+   * Minimum log level to output (default: 'info')
+   * 'debug' shows all logs, 'none' disables all logging
+   */
+  logLevel?: LogLevel;
 }
 
 export interface CreateEscrowParams {
@@ -296,6 +396,8 @@ export class PalindromeEscrowSDK {
   private readonly receiptTimeout: number;
   private readonly skipSimulation: boolean;
   private readonly defaultGasLimit: bigint;
+  private readonly logger: SDKLogger;
+  private readonly logLevel: LogLevel;
 
   /** LRU cache for escrow data with automatic eviction */
   private escrowCache: Map<string, { data: any; timestamp: number }> = new Map();
@@ -304,6 +406,8 @@ export class PalindromeEscrowSDK {
   /** Cache for immutable contract values */
   private walletBytecodeHashCache: Hex | null = null;
   private feeReceiverCache: Address | null = null;
+  /** Cached multicall support status per chain (null = not yet detected) */
+  private multicallSupported: boolean | null = null;
 
   private readonly STATE_NAMES = [
     "AWAITING_PAYMENT",
@@ -335,6 +439,8 @@ export class PalindromeEscrowSDK {
     this.receiptTimeout = config.receiptTimeout ?? 60000;
     this.skipSimulation = config.skipSimulation ?? false;
     this.defaultGasLimit = config.defaultGasLimit ?? 500000n;
+    this.logLevel = config.logLevel ?? 'info';
+    this.logger = config.logger ?? (this.logLevel === 'none' ? noOpLogger : defaultLogger);
 
     this.apollo = config.apolloClient ?? new ApolloClient({
       link: new HttpLink({
@@ -347,6 +453,19 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
   // PRIVATE HELPERS
   // ==========================================================================
+
+  /**
+   * Internal logging helper that respects log level configuration
+   */
+  private log(level: Exclude<LogLevel, 'none'>, message: string, context?: any): void {
+    const levels: LogLevel[] = ['debug', 'info', 'warn', 'error', 'none'];
+    const currentLevelIndex = levels.indexOf(this.logLevel);
+    const messageLevelIndex = levels.indexOf(level);
+
+    if (messageLevelIndex >= currentLevelIndex && messageLevelIndex < 4) {
+      this.logger[level](message, context);
+    }
+  }
 
   /**
    * Execute a contract write with resilient simulation handling.
@@ -395,15 +514,19 @@ export class PalindromeEscrowSDK {
         account: walletClient.account,
         chain: this.chain,
       });
-    } catch (error: any) {
+    } catch (error: unknown) {
+      if (!isViemError(error)) {
+        throw error;
+      }
+
       // Check if this is a simulation failure (not a user rejection or validation error)
       const isSimulationError =
-        error?.message?.includes("simulation") ||
-        error?.message?.includes("eth_call") ||
-        error?.message?.includes("execution reverted") ||
-        error?.cause?.message?.includes("simulation");
+        error.message?.includes("simulation") ||
+        error.message?.includes("eth_call") ||
+        error.message?.includes("execution reverted") ||
+        error.cause?.message?.includes("simulation");
 
-      const isUserRejection = error?.code === 4001;
+      const isUserRejection = error.code === 4001;
 
       // If it's a user rejection or not a simulation error, rethrow
       if (isUserRejection || !isSimulationError) {
@@ -411,10 +534,10 @@ export class PalindromeEscrowSDK {
       }
 
       // Fallback: bypass simulation and send transaction directly
-      console.warn(
-        `[PalindromeSDK] Simulation failed for ${functionName}, bypassing to send directly:`,
-        error?.message?.slice(0, 100),
-      );
+      this.log('warn', `Simulation failed for ${functionName}, bypassing to send directly`, {
+        error: error.message?.slice(0, 100),
+        functionName,
+      });
 
       const data = encodeFunctionData({ abi, functionName, args });
       return walletClient.sendTransaction({
@@ -437,8 +560,9 @@ export class PalindromeEscrowSDK {
           hash,
           timeout: this.receiptTimeout,
         });
-      } catch (error: any) {
-        if (error?.message?.includes("timed out") || error?.message?.includes("timeout")) {
+      } catch (error: unknown) {
+        const errorMessage = isViemError(error) ? error.message : String(error);
+        if (errorMessage.includes("timed out") || errorMessage.includes("timeout")) {
           throw new SDKError(
             `Transaction receipt timeout after ${this.receiptTimeout}ms`,
             SDKErrorCode.TRANSACTION_FAILED,
@@ -457,19 +581,22 @@ export class PalindromeEscrowSDK {
     operation: () => Promise<T>,
     operationName: string = "operation",
   ): Promise<T> {
-    let lastError: Error | undefined;
+    let lastError: unknown;
 
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
         return await operation();
-      } catch (error: any) {
+      } catch (error: unknown) {
         lastError = error;
 
         // Don't retry on validation errors or user rejections
+        const errorCode = (error as any)?.code;
+        const errorName = (error as any)?.name;
+
         if (
-          error?.code === SDKErrorCode.VALIDATION_ERROR ||
-          error?.code === 4001 || // User rejected
-          error?.name === "SDKError"
+          errorCode === SDKErrorCode.VALIDATION_ERROR ||
+          errorCode === 4001 || // User rejected
+          errorName === "SDKError"
         ) {
           throw error;
         }
@@ -908,15 +1035,57 @@ export class PalindromeEscrowSDK {
       Number(PalindromeEscrowSDK.MAX_NONCE_WORDS),
     );
 
-    // Batch fetch multiple bitmap words at once using multicall
-    const bitmapResults = await multicall(this.publicClient, {
-      contracts: Array.from({ length: estimatedWords }, (_, i) => ({
-        address: this.contractAddress,
-        abi: this.abiEscrow,
-        functionName: "getNonceBitmap",
-        args: [escrowId, signer, BigInt(i)],
-      })),
-    });
+    let bitmapResults: Array<{ status: string; result?: bigint }> = [];
+
+    // Check cached multicall support or detect on first use
+    if (this.multicallSupported === null) {
+      // Try a small multicall to detect support
+      try {
+        const testResults = await multicall(this.publicClient, {
+          contracts: [
+            {
+              address: this.contractAddress,
+              abi: this.abiEscrow,
+              functionName: "getNonceBitmap",
+              args: [escrowId, signer, 0n],
+            },
+          ],
+        });
+        this.multicallSupported = true;
+      } catch (error: unknown) {
+        const errorMessage = isViemError(error) ? error.message : String(error);
+        if (errorMessage.includes("multicall") || errorMessage.includes("Chain")) {
+          this.multicallSupported = false;
+        } else {
+          throw error; // Re-throw if it's a different error
+        }
+      }
+    }
+
+    // Use appropriate method based on cached support
+    if (this.multicallSupported) {
+      const multicallResults = await multicall(this.publicClient, {
+        contracts: Array.from({ length: estimatedWords }, (_, i) => ({
+          address: this.contractAddress,
+          abi: this.abiEscrow,
+          functionName: "getNonceBitmap",
+          args: [escrowId, signer, BigInt(i)],
+        })),
+      });
+      bitmapResults = multicallResults as Array<{ status: string; result?: bigint }>;
+    } else {
+      // Sequential calls fallback
+      bitmapResults = await Promise.all(
+        Array.from({ length: estimatedWords }, async (_, i) => {
+          try {
+            const result = await this.getNonceBitmap(escrowId, signer, BigInt(i));
+            return { status: "success", result };
+          } catch {
+            return { status: "failure" };
+          }
+        })
+      );
+    }
 
     const nonces: bigint[] = [];
 
@@ -1060,9 +1229,9 @@ export class PalindromeEscrowSDK {
    * @param params.token - ERC20 token address for payment
    * @param params.buyer - Buyer's wallet address
    * @param params.amount - Payment amount in token's smallest unit (e.g., wei for 18 decimals)
-   * @param params.maturityTimeDays - Optional days until maturity (default: 0, max: 3650)
+   * @param params.maturityTimeDays - Optional days until maturity (default: 1, min: 1, max: 3650)
    * @param params.arbiter - Optional arbiter address for dispute resolution
-   * @param params.title - Escrow title/description (1-256 characters)
+   * @param params.title - Escrow title/description (1-500 characters, supports encrypted hashes)
    * @param params.ipfsHash - Optional IPFS hash for additional details
    * @returns Object containing escrowId, transaction hash, and wallet address
    * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
@@ -1091,8 +1260,8 @@ export class PalindromeEscrowSDK {
     if (!params.title || params.title.length === 0) {
       throw new SDKError("Title is required", SDKErrorCode.VALIDATION_ERROR);
     }
-    if (params.title.length > 256) {
-      throw new SDKError("Title must be 256 characters or less", SDKErrorCode.VALIDATION_ERROR);
+    if (params.title.length > 500) {
+      throw new SDKError("Title must be 500 characters or less", SDKErrorCode.VALIDATION_ERROR);
     }
 
     // Validate arbiter is not buyer or seller
@@ -1106,7 +1275,7 @@ export class PalindromeEscrowSDK {
       }
     }
 
-    const maturityDays = params.maturityTimeDays ?? 0n;
+    const maturityDays = params.maturityTimeDays ?? 1n;
     const ipfsHash = params.ipfsHash ?? "";
 
     // Predict next escrow ID and wallet address
@@ -1170,9 +1339,9 @@ export class PalindromeEscrowSDK {
    * @param params.token - ERC20 token address for payment
    * @param params.seller - Seller's wallet address
    * @param params.amount - Payment amount in token's smallest unit (e.g., wei for 18 decimals)
-   * @param params.maturityTimeDays - Optional days until maturity (default: 0, max: 3650)
+   * @param params.maturityTimeDays - Optional days until maturity (default: 1, min: 1, max: 3650)
    * @param params.arbiter - Optional arbiter address for dispute resolution
-   * @param params.title - Escrow title/description (1-256 characters)
+   * @param params.title - Escrow title/description (1-500 characters, supports encrypted hashes)
    * @param params.ipfsHash - Optional IPFS hash for additional details
    * @returns Object containing escrowId, transaction hash, and wallet address
    * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
@@ -1202,8 +1371,8 @@ export class PalindromeEscrowSDK {
     if (!params.title || params.title.length === 0) {
       throw new SDKError("Title is required", SDKErrorCode.VALIDATION_ERROR);
     }
-    if (params.title.length > 256) {
-      throw new SDKError("Title must be 256 characters or less", SDKErrorCode.VALIDATION_ERROR);
+    if (params.title.length > 500) {
+      throw new SDKError("Title must be 500 characters or less", SDKErrorCode.VALIDATION_ERROR);
     }
 
     // Validate arbiter is not buyer or seller
@@ -1217,7 +1386,7 @@ export class PalindromeEscrowSDK {
       }
     }
 
-    const maturityDays = params.maturityTimeDays ?? 0n;
+    const maturityDays = params.maturityTimeDays ?? 1n;
     const ipfsHash = params.ipfsHash ?? "";
 
     // Approve token spending
@@ -1633,9 +1802,10 @@ export class PalindromeEscrowSDK {
    *
    * This function allows the buyer to cancel the escrow unilaterally if:
    * - The buyer has already requested cancellation via `requestCancel`
-   * - The maturity time + 24-hour grace period has passed
+   * - The maturity time has passed
    * - The seller has not agreed to mutual cancellation
    * - No dispute is active
+   * - An arbiter is assigned to the escrow
    *
    * Funds are returned to the buyer without any fee deduction.
    *
@@ -1672,17 +1842,17 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Auto-release funds to seller after maturity + grace period
+   * Auto-release funds to seller after maturity time
    *
    * This function allows the seller to claim funds unilaterally after the maturity time
-   * plus a 24-hour grace period has passed. This protects sellers when buyers become
-   * unresponsive after receiving goods/services.
+   * has passed. This protects sellers when buyers become unresponsive after receiving
+   * goods/services.
    *
    * Requirements:
    * - Escrow must be in AWAITING_DELIVERY state
    * - No dispute has been started
    * - Buyer has not requested cancellation
-   * - maturityTime + 24 hours (GRACE_PERIOD) has passed
+   * - maturityTime has passed
    * - Seller has already provided wallet signature (via createEscrow or acceptEscrow)
    *
    * A 1% fee is deducted from the payment amount.
@@ -2175,21 +2345,23 @@ export class PalindromeEscrowSDK {
         gasEstimate,
         result,
       };
-    } catch (error: any) {
+    } catch (error: unknown) {
       // Extract revert reason
       let revertReason = "Unknown error";
 
-      if (error?.cause?.reason) {
-        revertReason = error.cause.reason;
-      } else if (error?.shortMessage) {
-        revertReason = error.shortMessage;
-      } else if (error?.message) {
-        // Try to parse revert reason from error message
-        const match = error.message.match(/reverted with reason string '([^']+)'/);
-        if (match) {
-          revertReason = match[1];
-        } else {
-          revertReason = error.message.slice(0, 200);
+      if (isViemError(error)) {
+        if (error.cause?.reason) {
+          revertReason = error.cause.reason;
+        } else if (hasShortMessage(error)) {
+          revertReason = error.shortMessage;
+        } else if (error.message) {
+          // Try to parse revert reason from error message
+          const match = error.message.match(/reverted with reason string '([^']+)'/);
+          if (match) {
+            revertReason = match[1];
+          } else {
+            revertReason = error.message.slice(0, 200);
+          }
         }
       }
 
@@ -2437,6 +2609,7 @@ export class PalindromeEscrowSDK {
     this.tokenDecimalsCache.clear();
     this.feeReceiverCache = null;
     this.cachedFeeBps = null;
+    this.multicallSupported = null;
     // Note: walletBytecodeHashCache is immutable and never needs clearing
   }
 
@@ -2445,6 +2618,13 @@ export class PalindromeEscrowSDK {
    */
   clearEscrowCache(): void {
     this.escrowCache.clear();
+  }
+
+  /**
+   * Clear multicall cache (useful when switching chains)
+   */
+  clearMulticallCache(): void {
+    this.multicallSupported = null;
   }
 
   // ==========================================================================
@@ -2498,8 +2678,11 @@ export class PalindromeEscrowSDK {
           callback(deal.state, lastState);
         }
         lastState = deal.state;
-      } catch (e) {
-        // Silently ignore errors during polling
+      } catch (e: any) {
+        this.log('error', 'Error polling escrow state', {
+          escrowId: escrowId.toString(),
+          error: e?.message
+        });
       }
     };
 
@@ -2546,7 +2729,7 @@ export class PalindromeEscrowSDK {
    * - Either party calls `requestCancel` to initiate
    * - If only one party requested, the other must also call `requestCancel` for mutual cancel
    * - When both request, the escrow is automatically canceled and funds return to buyer
-   * - Alternatively, buyer can use `cancelByTimeout` after maturity + grace period
+   * - Alternatively, buyer can use `cancelByTimeout` after maturity time (if arbiter is set)
    *
    * @param escrowId - The escrow ID to check
    * @returns Object with buyer/seller cancel request status and whether mutual cancel is complete
@@ -2683,8 +2866,11 @@ export class PalindromeEscrowSDK {
       }) as bigint;
       this.cachedFeeBps = feeBps;
       return feeBps;
-    } catch {
+    } catch (e: any) {
       // Fall back to default if not readable (private constant)
+      this.log('warn', 'Could not read FEE_BPS from contract, using default', {
+        error: e?.message
+      });
       this.cachedFeeBps = 100n; // 1% fee
       return this.cachedFeeBps;
     }
