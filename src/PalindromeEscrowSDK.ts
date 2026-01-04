@@ -41,6 +41,7 @@ import {
   encodeAbiParameters,
   getAddress,
   zeroAddress,
+  TransactionReceipt,
 } from "viem";
 import { readContract, multicall } from "viem/actions";
 import PalindromeCryptoEscrowABI from "./contract/PalindromeCryptoEscrow.json";
@@ -86,7 +87,7 @@ function isViemError(error: unknown): error is ViemError {
     typeof error === 'object' &&
     error !== null &&
     'message' in error &&
-    typeof (error as any).message === 'string'
+    typeof (error as Record<string, unknown>).message === 'string'
   );
 }
 
@@ -97,7 +98,11 @@ function isContractError(error: unknown): error is ContractError {
 
 /** Type guard to check if error has a short message */
 function hasShortMessage(error: unknown): error is ViemError & { shortMessage: string } {
-  return isViemError(error) && 'shortMessage' in error && typeof (error as any).shortMessage === 'string';
+  return (
+    isViemError(error) &&
+    'shortMessage' in error &&
+    typeof (error as Record<string, unknown>).shortMessage === 'string'
+  );
 }
 
 // ==========================================================================
@@ -107,10 +112,10 @@ function hasShortMessage(error: unknown): error is ViemError & { shortMessage: s
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'none';
 
 export interface SDKLogger {
-  debug(message: string, context?: any): void;
-  info(message: string, context?: any): void;
-  warn(message: string, context?: any): void;
-  error(message: string, context?: any): void;
+  debug(message: string, context?: unknown): void;
+  info(message: string, context?: unknown): void;
+  warn(message: string, context?: unknown): void;
+  error(message: string, context?: unknown): void;
 }
 
 /** Default console logger */
@@ -167,6 +172,35 @@ export enum Role {
   Seller = 2,
   Arbiter = 3,
 }
+
+// ==========================================================================
+// CONSTANTS
+// ==========================================================================
+
+/** Maximum length for string fields (title, IPFS hash) */
+const MAX_STRING_LENGTH = 500;
+
+/** User rejection error code from wallet */
+const USER_REJECTION_CODE = 4001;
+
+/** Seconds per day for maturity calculations */
+const SECONDS_PER_DAY = 86400n;
+
+/** Nonce bitmap word size in bits */
+const NONCE_BITMAP_SIZE = 256;
+
+/** Default cache TTL in milliseconds */
+const DEFAULT_CACHE_TTL = 5000;
+
+/** Default transaction receipt timeout in milliseconds */
+const DEFAULT_RECEIPT_TIMEOUT = 60000;
+
+/** Default polling interval in milliseconds */
+const DEFAULT_POLLING_INTERVAL = 5000;
+
+// ==========================================================================
+// ERROR CODES
+// ==========================================================================
 
 export enum SDKErrorCode {
   WALLET_NOT_CONNECTED = "WALLET_NOT_CONNECTED",
@@ -274,6 +308,27 @@ export interface CreateEscrowAndDepositParams {
   ipfsHash?: string;
 }
 
+/** Raw escrow data from contract (before type narrowing to Address/Hex) */
+export interface RawEscrowData {
+  token: `0x${string}`;
+  buyer: `0x${string}`;
+  seller: `0x${string}`;
+  arbiter: `0x${string}`;
+  wallet: `0x${string}`;
+  amount: bigint;
+  depositTime: bigint;
+  maturityTime: bigint;
+  disputeStartTime: bigint;
+  state: number;
+  buyerCancelRequested: boolean;
+  sellerCancelRequested: boolean;
+  tokenDecimals: number;
+  sellerWalletSig: `0x${string}`;
+  buyerWalletSig: `0x${string}`;
+  arbiterWalletSig: `0x${string}`;
+}
+
+/** Parsed escrow data with proper types */
 export interface EscrowData {
   token: Address;
   buyer: Address;
@@ -400,7 +455,7 @@ export class PalindromeEscrowSDK {
   private readonly logLevel: LogLevel;
 
   /** LRU cache for escrow data with automatic eviction */
-  private escrowCache: Map<string, { data: any; timestamp: number }> = new Map();
+  private escrowCache: Map<string, { data: unknown; timestamp: number }> = new Map();
   /** Cache for token decimals (rarely changes, no eviction needed) */
   private tokenDecimalsCache: Map<Address, number> = new Map();
   /** Cache for immutable contract values */
@@ -430,13 +485,13 @@ export class PalindromeEscrowSDK {
     this.publicClient = config.publicClient;
     this.walletClient = config.walletClient;
     this.chain = config.chain ?? hardhat;
-    this.cacheTTL = config.cacheTTL ?? 5000;
+    this.cacheTTL = config.cacheTTL ?? DEFAULT_CACHE_TTL;
     this.maxCacheSize = config.maxCacheSize ?? 1000;
     this.enableRetry = config.enableRetry ?? true;
     this.maxRetries = config.maxRetries ?? 3;
     this.retryDelay = config.retryDelay ?? 1000;
     this.gasBuffer = config.gasBuffer ?? 20;
-    this.receiptTimeout = config.receiptTimeout ?? 60000;
+    this.receiptTimeout = config.receiptTimeout ?? DEFAULT_RECEIPT_TIMEOUT;
     this.skipSimulation = config.skipSimulation ?? false;
     this.defaultGasLimit = config.defaultGasLimit ?? 500000n;
     this.logLevel = config.logLevel ?? 'info';
@@ -492,19 +547,13 @@ export class PalindromeEscrowSDK {
   ): Promise<Hex> {
     const { address, abi, functionName, args } = params;
 
-    // If skipSimulation is enabled, send transaction directly
+    // Path 1: Skip simulation entirely if configured
     if (this.skipSimulation) {
-      const data = encodeFunctionData({ abi, functionName, args });
-      return walletClient.sendTransaction({
-        to: address,
-        data,
-        account: walletClient.account,
-        chain: this.chain,
-        gas: this.defaultGasLimit,
-      });
+      this.log('debug', `Skipping simulation for ${functionName}, sending directly`);
+      return this.sendTransactionDirect(walletClient, params);
     }
 
-    // Try standard writeContract (which includes simulation)
+    // Path 2: Try normal write with simulation
     try {
       return await walletClient.writeContract({
         address,
@@ -515,45 +564,25 @@ export class PalindromeEscrowSDK {
         chain: this.chain,
       });
     } catch (error: unknown) {
-      if (!isViemError(error)) {
-        throw error;
+      // Path 3: Conditional fallback based on error type
+      if (!this.isSimulationErrorType(error)) {
+        throw error; // Not a simulation error, propagate
       }
 
-      // Check if this is a simulation failure (not a user rejection or validation error)
-      const isSimulationError =
-        error.message?.includes("simulation") ||
-        error.message?.includes("eth_call") ||
-        error.message?.includes("execution reverted") ||
-        error.cause?.message?.includes("simulation");
-
-      const isUserRejection = error.code === 4001;
-
-      // If it's a user rejection or not a simulation error, rethrow
-      if (isUserRejection || !isSimulationError) {
-        throw error;
-      }
-
-      // Fallback: bypass simulation and send transaction directly
+      // Simulation failed - send directly as fallback
       this.log('warn', `Simulation failed for ${functionName}, bypassing to send directly`, {
-        error: error.message?.slice(0, 100),
+        error: isViemError(error) ? error.message?.slice(0, 100) : String(error),
         functionName,
       });
 
-      const data = encodeFunctionData({ abi, functionName, args });
-      return walletClient.sendTransaction({
-        to: address,
-        data,
-        account: walletClient.account,
-        chain: this.chain,
-        gas: this.defaultGasLimit,
-      });
+      return this.sendTransactionDirect(walletClient, params);
     }
   }
 
   /**
    * Wait for transaction receipt with timeout and retry logic.
    */
-  private async waitForReceipt(hash: Hex): Promise<any> {
+  private async waitForReceipt(hash: Hex): Promise<TransactionReceipt> {
     return this.withRetry(async () => {
       try {
         return await this.publicClient.waitForTransactionReceipt({
@@ -595,7 +624,7 @@ export class PalindromeEscrowSDK {
 
         if (
           errorCode === SDKErrorCode.VALIDATION_ERROR ||
-          errorCode === 4001 || // User rejected
+          errorCode === USER_REJECTION_CODE || // User rejected
           errorName === "SDKError"
         ) {
           throw error;
@@ -619,9 +648,160 @@ export class PalindromeEscrowSDK {
   }
 
   /**
+   * Extract error message from unknown error type.
+   */
+  private extractErrorMessage(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+    if (isViemError(error)) {
+      return error.shortMessage || error.message;
+    }
+    if (typeof error === 'string') {
+      return error;
+    }
+    return String(error);
+  }
+
+  /**
+   * Validate common escrow creation parameters.
+   */
+  private validateCreateEscrowParams(params: {
+    tokenAddress: Address;
+    buyerAddress: Address;
+    sellerAddress: Address;
+    arbiterAddress: Address;
+    amount: bigint;
+    maturityDays: bigint;
+    title: string;
+  }): void {
+    const { tokenAddress, buyerAddress, sellerAddress, amount, maturityDays, title } = params;
+
+    if (!tokenAddress || tokenAddress === zeroAddress) {
+      throw new SDKError("Invalid token address", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (!buyerAddress || buyerAddress === zeroAddress) {
+      throw new SDKError("Invalid buyer address", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (!sellerAddress || sellerAddress === zeroAddress) {
+      throw new SDKError("Invalid seller address", SDKErrorCode.VALIDATION_ERROR);
+    }
+    // Note: arbiterAddress can be zeroAddress (no arbiter)
+    if (amount <= 0n) {
+      throw new SDKError("Amount must be greater than 0", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (maturityDays < 0n) {
+      throw new SDKError("Maturity days cannot be negative", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (!title || title.trim().length === 0) {
+      throw new SDKError("Title cannot be empty", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (title.length > MAX_STRING_LENGTH) {
+      throw new SDKError(
+        `Title must be ${MAX_STRING_LENGTH} characters or less`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Verify caller is the buyer, throw if not.
+   */
+  private verifyBuyer(caller: Address, escrow: EscrowData): void {
+    if (caller.toLowerCase() !== escrow.buyer.toLowerCase()) {
+      throw new SDKError("Only buyer can perform this action", SDKErrorCode.NOT_BUYER);
+    }
+  }
+
+  /**
+   * Verify caller is the seller, throw if not.
+   */
+  private verifySeller(caller: Address, escrow: EscrowData): void {
+    if (caller.toLowerCase() !== escrow.seller.toLowerCase()) {
+      throw new SDKError("Only seller can perform this action", SDKErrorCode.NOT_SELLER);
+    }
+  }
+
+  /**
+   * Verify caller is the arbiter, throw if not.
+   */
+  private verifyArbiter(caller: Address, escrow: EscrowData): void {
+    if (caller.toLowerCase() !== escrow.arbiter.toLowerCase()) {
+      throw new SDKError("Only arbiter can perform this action", SDKErrorCode.NOT_ARBITER);
+    }
+  }
+
+  /**
+   * Verify escrow is in expected state, throw if not.
+   */
+  private verifyState(escrow: EscrowData, expectedState: EscrowState, actionName: string): void {
+    if (escrow.state !== expectedState) {
+      throw new SDKError(
+        `Cannot ${actionName}: escrow is in state ${escrow.state}, expected ${expectedState}`,
+        SDKErrorCode.INVALID_STATE,
+      );
+    }
+  }
+
+  /**
+   * Send transaction directly without simulation.
+   * Encodes function data manually and sends with fixed gas limit.
+   *
+   * @param walletClient - The wallet client to send from
+   * @param params - Contract write parameters
+   * @returns Transaction hash
+   */
+  private async sendTransactionDirect(
+    walletClient: EscrowWalletClient,
+    params: {
+      address: Address;
+      abi: Abi;
+      functionName: string;
+      args: readonly unknown[];
+    }
+  ): Promise<Hex> {
+    const { address, abi, functionName, args } = params;
+
+    const data = encodeFunctionData({ abi, functionName, args });
+
+    return walletClient.sendTransaction({
+      to: address,
+      data,
+      account: walletClient.account,
+      chain: this.chain,
+      gas: this.defaultGasLimit,
+    });
+  }
+
+  /**
+   * Detect if error is a simulation failure (not user rejection or validation error).
+   *
+   * @param error - The error to check
+   * @returns True if error is from simulation failure
+   */
+  private isSimulationErrorType(error: unknown): boolean {
+    if (!isViemError(error)) {
+      return false;
+    }
+
+    // User rejection is NOT a simulation error
+    if (error.code === USER_REJECTION_CODE) {
+      return false;
+    }
+
+    // Check for simulation-specific error patterns
+    return !!(
+      error.message?.includes("simulation") ||
+      error.message?.includes("eth_call") ||
+      error.message?.includes("execution reverted") ||
+      error.cause?.message?.includes("simulation")
+    );
+  }
+
+  /**
    * Set a value in the LRU cache with automatic eviction.
    */
-  private setCacheValue(key: string, data: any): void {
+  private setCacheValue<T>(key: string, data: T): void {
     // If at capacity, remove oldest entry (first in Map)
     if (this.escrowCache.size >= this.maxCacheSize) {
       const oldestKey = this.escrowCache.keys().next().value;
@@ -877,13 +1057,14 @@ export class PalindromeEscrowSDK {
   /**
    * Get raw escrow data from contract
    */
-  async getEscrowById(escrowId: bigint): Promise<any> {
-    return readContract(this.publicClient, {
+  async getEscrowById(escrowId: bigint): Promise<RawEscrowData> {
+    const raw = await readContract(this.publicClient, {
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "getEscrow",
       args: [escrowId],
     });
+    return raw as RawEscrowData;
   }
 
   /**
@@ -929,11 +1110,11 @@ export class PalindromeEscrowSDK {
   /**
    * Get the nonce bitmap from the contract.
    * 
-   * Each bitmap word contains 256 nonce states. A set bit means the nonce is used.
+   * Each bitmap word contains NONCE_BITMAP_SIZE nonce states. A set bit means the nonce is used.
    * 
    * @param escrowId - The escrow ID
    * @param signer - The signer's address
-   * @param wordIndex - The word index (nonce / 256)
+   * @param wordIndex - The word index (nonce / NONCE_BITMAP_SIZE)
    * @returns The bitmap as a bigint
    */
   async getNonceBitmap(escrowId: bigint, signer: Address, wordIndex: bigint = 0n): Promise<bigint> {
@@ -984,7 +1165,7 @@ export class PalindromeEscrowSDK {
     while (wordIndex < PalindromeEscrowSDK.MAX_NONCE_WORDS) {
       const bitmap = await this.getNonceBitmap(escrowId, signer, wordIndex);
 
-      // If bitmap is all 1s (all 256 nonces used), check next word
+      // If bitmap is all 1s (all NONCE_BITMAP_SIZE nonces used), check next word
       if (bitmap === (1n << 256n) - 1n) {
         wordIndex++;
         continue;
@@ -1008,75 +1189,86 @@ export class PalindromeEscrowSDK {
   }
 
   /**
-   * Get multiple available nonces at once (for batch operations).
+   * Calculate estimated number of bitmap words needed for nonce count.
+   * Uses conservative estimate with buffer to minimize round trips.
+   *
+   * @param count - Number of nonces needed
+   * @returns Estimated number of bitmap words to fetch
+   */
+  private getEstimatedWordCount(count: number): number {
+    return Math.min(
+      Math.ceil(count / 128) + 1, // Conservative estimate with buffer
+      Number(PalindromeEscrowSDK.MAX_NONCE_WORDS)
+    );
+  }
+
+  /**
+   * Detect if chain supports Multicall3 and cache result.
+   * Performs a test multicall on first invocation and caches the result.
+   *
+   * @param escrowId - Escrow ID for test call
+   * @param signer - Signer address for test call
+   */
+  private async detectMulticallSupport(
+    escrowId: bigint,
+    signer: Address
+  ): Promise<void> {
+    if (this.multicallSupported !== null) {
+      return; // Already detected
+    }
+
+    this.log('debug', 'Detecting multicall support...');
+    try {
+      await multicall(this.publicClient, {
+        contracts: [{
+          address: this.contractAddress,
+          abi: this.abiEscrow,
+          functionName: "getNonceBitmap",
+          args: [escrowId, signer, 0n],
+        }],
+      });
+      this.multicallSupported = true;
+      this.log('info', 'Multicall3 supported on this chain');
+    } catch (error: unknown) {
+      const message = this.extractErrorMessage(error);
+      if (message.includes("multicall") || message.includes("Chain")) {
+        this.multicallSupported = false;
+        this.log('info', 'Multicall3 not supported, using sequential calls');
+      } else {
+        throw error; // Different error, re-throw
+      }
+    }
+  }
+
+  /**
+   * Fetch nonce bitmaps using either multicall or sequential calls.
+   * Automatically uses multicall if supported, otherwise falls back to sequential.
    *
    * @param escrowId - The escrow ID
    * @param signer - The signer's address
-   * @param count - Number of nonces to retrieve (max 256)
-   * @returns Array of available nonces
-   * @throws SDKError if count exceeds limit or nonce space is exhausted
+   * @param wordCount - Number of bitmap words to fetch
+   * @returns Array of bitmap results with status
    */
-  async getMultipleNonces(escrowId: bigint, signer: Address, count: number): Promise<bigint[]> {
-    // Limit count to prevent excessive RPC calls
-    const MAX_NONCES_PER_REQUEST = 256;
-    if (count > MAX_NONCES_PER_REQUEST) {
-      throw new SDKError(
-        `Cannot request more than ${MAX_NONCES_PER_REQUEST} nonces at once`,
-        SDKErrorCode.VALIDATION_ERROR,
-      );
-    }
-    if (count <= 0) {
-      return [];
-    }
-
-    // Estimate how many words we might need (count / 256 + buffer)
-    const estimatedWords = Math.min(
-      Math.ceil(count / 128) + 1, // Conservative estimate with buffer
-      Number(PalindromeEscrowSDK.MAX_NONCE_WORDS),
-    );
-
-    let bitmapResults: Array<{ status: string; result?: bigint }> = [];
-
-    // Check cached multicall support or detect on first use
-    if (this.multicallSupported === null) {
-      // Try a small multicall to detect support
-      try {
-        const testResults = await multicall(this.publicClient, {
-          contracts: [
-            {
-              address: this.contractAddress,
-              abi: this.abiEscrow,
-              functionName: "getNonceBitmap",
-              args: [escrowId, signer, 0n],
-            },
-          ],
-        });
-        this.multicallSupported = true;
-      } catch (error: unknown) {
-        const errorMessage = isViemError(error) ? error.message : String(error);
-        if (errorMessage.includes("multicall") || errorMessage.includes("Chain")) {
-          this.multicallSupported = false;
-        } else {
-          throw error; // Re-throw if it's a different error
-        }
-      }
-    }
-
-    // Use appropriate method based on cached support
+  private async fetchNonceBitmaps(
+    escrowId: bigint,
+    signer: Address,
+    wordCount: number
+  ): Promise<Array<{ status: string; result?: bigint }>> {
     if (this.multicallSupported) {
-      const multicallResults = await multicall(this.publicClient, {
-        contracts: Array.from({ length: estimatedWords }, (_, i) => ({
+      // Use multicall for efficiency
+      const results = await multicall(this.publicClient, {
+        contracts: Array.from({ length: wordCount }, (_, i) => ({
           address: this.contractAddress,
           abi: this.abiEscrow,
           functionName: "getNonceBitmap",
           args: [escrowId, signer, BigInt(i)],
         })),
       });
-      bitmapResults = multicallResults as Array<{ status: string; result?: bigint }>;
+      return results as Array<{ status: string; result?: bigint }>;
     } else {
-      // Sequential calls fallback
-      bitmapResults = await Promise.all(
-        Array.from({ length: estimatedWords }, async (_, i) => {
+      // Sequential fallback for chains without multicall
+      return Promise.all(
+        Array.from({ length: wordCount }, async (_, i) => {
           try {
             const result = await this.getNonceBitmap(escrowId, signer, BigInt(i));
             return { status: "success", result };
@@ -1086,25 +1278,78 @@ export class PalindromeEscrowSDK {
         })
       );
     }
+  }
 
+  /**
+   * Scan bitmap words for available (unused) nonces.
+   * Performs bit-level scanning with early exit when count is reached.
+   *
+   * @param bitmapResults - Array of bitmap words fetched from contract
+   * @param count - Maximum number of nonces to find
+   * @returns Array of available nonce values
+   */
+  private scanBitmapsForNonces(
+    bitmapResults: Array<{ status: string; result?: bigint }>,
+    count: number
+  ): bigint[] {
     const nonces: bigint[] = [];
 
-    for (let wordIndex = 0; wordIndex < bitmapResults.length && nonces.length < count; wordIndex++) {
-      const result = bitmapResults[wordIndex];
-      if (result.status !== "success") continue;
+    for (let wordIdx = 0; wordIdx < bitmapResults.length && nonces.length < count; wordIdx++) {
+      const wordResult = bitmapResults[wordIdx];
 
-      const bitmap = result.result as bigint;
+      if (wordResult.status !== "success" || wordResult.result === undefined) {
+        continue; // Skip failed fetches
+      }
 
-      for (let i = 0n; i < 256n && nonces.length < count; i++) {
-        if ((bitmap & (1n << i)) === 0n) {
-          nonces.push(BigInt(wordIndex) * 256n + i);
+      const bitmap = wordResult.result;
+      const baseNonce = BigInt(wordIdx) * BigInt(NONCE_BITMAP_SIZE);
+
+      // Scan each bit in the word (0 = available, 1 = used)
+      for (let bitPos = 0n; bitPos < BigInt(NONCE_BITMAP_SIZE) && nonces.length < count; bitPos++) {
+        if ((bitmap & (1n << bitPos)) === 0n) {
+          nonces.push(baseNonce + bitPos);
         }
       }
     }
 
+    return nonces;
+  }
+
+  /**
+   * Get multiple available nonces at once (for batch operations).
+   *
+   * @param escrowId - The escrow ID
+   * @param signer - The signer's address
+   * @param count - Number of nonces to retrieve (max NONCE_BITMAP_SIZE)
+   * @returns Array of available nonces
+   * @throws SDKError if count exceeds limit or nonce space is exhausted
+   */
+  async getMultipleNonces(escrowId: bigint, signer: Address, count: number): Promise<bigint[]> {
+    // 1. Input validation
+    if (count > NONCE_BITMAP_SIZE) {
+      throw new SDKError(
+        `Cannot request more than ${NONCE_BITMAP_SIZE} nonces at once`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+    if (count <= 0) {
+      return [];
+    }
+
+    // 2. Detect multicall support (cached after first call)
+    await this.detectMulticallSupport(escrowId, signer);
+
+    // 3. Fetch bitmap words
+    const estimatedWords = this.getEstimatedWordCount(count);
+    const bitmapResults = await this.fetchNonceBitmaps(escrowId, signer, estimatedWords);
+
+    // 4. Scan bitmaps for available nonces
+    const nonces = this.scanBitmapsForNonces(bitmapResults, count);
+
+    // 5. Verify we found enough nonces
     if (nonces.length < count) {
       throw new SDKError(
-        `Only found ${nonces.length} available nonces, requested ${count}`,
+        `Could only find ${nonces.length} available nonces out of ${count} requested`,
         SDKErrorCode.VALIDATION_ERROR,
       );
     }
@@ -1250,22 +1495,21 @@ export class PalindromeEscrowSDK {
     const arbiter = params.arbiter
       ? validateAddress(params.arbiter, "arbiter")
       : zeroAddress;
+    const sellerAddress = walletClient.account.address;
+    const maturityDays = params.maturityTimeDays ?? 1n;
 
-    // Validate amount
-    if (params.amount <= 0n) {
-      throw new SDKError("Amount must be greater than 0", SDKErrorCode.VALIDATION_ERROR);
-    }
-
-    // Validate title
-    if (!params.title || params.title.length === 0) {
-      throw new SDKError("Title is required", SDKErrorCode.VALIDATION_ERROR);
-    }
-    if (params.title.length > 500) {
-      throw new SDKError("Title must be 500 characters or less", SDKErrorCode.VALIDATION_ERROR);
-    }
+    // Validate using helper
+    this.validateCreateEscrowParams({
+      tokenAddress: token,
+      buyerAddress: buyer,
+      sellerAddress,
+      arbiterAddress: arbiter,
+      amount: params.amount,
+      maturityDays,
+      title: params.title,
+    });
 
     // Validate arbiter is not buyer or seller
-    const sellerAddress = walletClient.account.address;
     if (!isZeroAddress(arbiter)) {
       if (getAddress(arbiter) === getAddress(buyer)) {
         throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
@@ -1275,7 +1519,6 @@ export class PalindromeEscrowSDK {
       }
     }
 
-    const maturityDays = params.maturityTimeDays ?? 1n;
     const ipfsHash = params.ipfsHash ?? "";
 
     // Predict next escrow ID and wallet address
@@ -1361,22 +1604,21 @@ export class PalindromeEscrowSDK {
     const arbiter = params.arbiter
       ? validateAddress(params.arbiter, "arbiter")
       : zeroAddress;
+    const buyerAddress = walletClient.account.address;
+    const maturityDays = params.maturityTimeDays ?? 1n;
 
-    // Validate amount
-    if (params.amount <= 0n) {
-      throw new SDKError("Amount must be greater than 0", SDKErrorCode.VALIDATION_ERROR);
-    }
-
-    // Validate title
-    if (!params.title || params.title.length === 0) {
-      throw new SDKError("Title is required", SDKErrorCode.VALIDATION_ERROR);
-    }
-    if (params.title.length > 500) {
-      throw new SDKError("Title must be 500 characters or less", SDKErrorCode.VALIDATION_ERROR);
-    }
+    // Validate using helper
+    this.validateCreateEscrowParams({
+      tokenAddress: token,
+      buyerAddress,
+      sellerAddress: seller,
+      arbiterAddress: arbiter,
+      amount: params.amount,
+      maturityDays,
+      title: params.title,
+    });
 
     // Validate arbiter is not buyer or seller
-    const buyerAddress = walletClient.account.address;
     if (!isZeroAddress(arbiter)) {
       if (getAddress(arbiter) === getAddress(seller)) {
         throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
@@ -1386,7 +1628,6 @@ export class PalindromeEscrowSDK {
       }
     }
 
-    const maturityDays = params.maturityTimeDays ?? 1n;
     const ipfsHash = params.ipfsHash ?? "";
 
     // Approve token spending
@@ -1474,18 +1715,9 @@ export class PalindromeEscrowSDK {
 
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    // Verify caller is buyer
-    if (!addressEquals(walletClient.account.address, deal.buyer)) {
-      throw new SDKError("Only buyer can deposit", SDKErrorCode.NOT_BUYER);
-    }
-
-    // Verify state
-    if (deal.state !== EscrowState.AWAITING_PAYMENT) {
-      throw new SDKError(
-        `Invalid state: ${this.STATE_NAMES[deal.state]}. Expected: AWAITING_PAYMENT`,
-        SDKErrorCode.INVALID_STATE,
-      );
-    }
+    // Verify caller and state using helpers
+    this.verifyBuyer(walletClient.account.address, deal);
+    this.verifyState(deal, EscrowState.AWAITING_PAYMENT, "deposit");
 
     // Approve token spending
     await this.approveTokenIfNeeded(
@@ -1543,18 +1775,9 @@ export class PalindromeEscrowSDK {
 
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    // Verify caller is seller
-    if (!addressEquals(walletClient.account.address, deal.seller)) {
-      throw new SDKError("Only seller can accept", SDKErrorCode.NOT_SELLER);
-    }
-
-    // Verify state
-    if (deal.state !== EscrowState.AWAITING_DELIVERY) {
-      throw new SDKError(
-        `Invalid state: ${this.STATE_NAMES[deal.state]}. Expected: AWAITING_DELIVERY`,
-        SDKErrorCode.INVALID_STATE,
-      );
-    }
+    // Verify caller and state using helpers
+    this.verifySeller(walletClient.account.address, deal);
+    this.verifyState(deal, EscrowState.AWAITING_DELIVERY, "accept");
 
     // Check if already accepted (seller sig already exists)
     if (deal.sellerWalletSig && deal.sellerWalletSig !== "0x") {
@@ -1610,18 +1833,9 @@ export class PalindromeEscrowSDK {
 
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    // Verify caller is buyer
-    if (!addressEquals(walletClient.account.address, deal.buyer)) {
-      throw new SDKError("Only buyer can confirm delivery", SDKErrorCode.NOT_BUYER);
-    }
-
-    // Verify state
-    if (deal.state !== EscrowState.AWAITING_DELIVERY) {
-      throw new SDKError(
-        `Invalid state: ${this.STATE_NAMES[deal.state]}. Expected: AWAITING_DELIVERY`,
-        SDKErrorCode.INVALID_STATE,
-      );
-    }
+    // Verify caller and state using helpers
+    this.verifyBuyer(walletClient.account.address, deal);
+    this.verifyState(deal, EscrowState.AWAITING_DELIVERY, "confirm delivery");
 
     // Sign wallet authorization
     const buyerWalletSig = await this.signWalletAuthorization(
@@ -1714,10 +1928,8 @@ export class PalindromeEscrowSDK {
 
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    // Verify caller is buyer
-    if (!addressEquals(buyerWalletClient.account.address, deal.buyer)) {
-      throw new SDKError("Only buyer can sign", SDKErrorCode.NOT_BUYER);
-    }
+    // Verify caller using helper
+    this.verifyBuyer(buyerWalletClient.account.address, deal);
 
     // Parallelize deadline and nonce fetching
     const [deadline, nonce] = await Promise.all([
@@ -1824,10 +2036,8 @@ export class PalindromeEscrowSDK {
 
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    // Verify caller is buyer
-    if (!addressEquals(walletClient.account.address, deal.buyer)) {
-      throw new SDKError("Only buyer can cancel by timeout", SDKErrorCode.NOT_BUYER);
-    }
+    // Verify caller using helper
+    this.verifyBuyer(walletClient.account.address, deal);
 
     // Cancel by timeout
     const hash = await this.resilientWriteContract(walletClient, {
@@ -1874,18 +2084,9 @@ export class PalindromeEscrowSDK {
 
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    // Verify caller is seller
-    if (!addressEquals(walletClient.account.address, deal.seller)) {
-      throw new SDKError("Only seller can auto-release", SDKErrorCode.NOT_SELLER);
-    }
-
-    // Verify state
-    if (deal.state !== EscrowState.AWAITING_DELIVERY) {
-      throw new SDKError(
-        `Invalid state: ${this.STATE_NAMES[deal.state]}. Expected: AWAITING_DELIVERY`,
-        SDKErrorCode.INVALID_STATE,
-      );
-    }
+    // Verify caller and state using helpers
+    this.verifySeller(walletClient.account.address, deal);
+    this.verifyState(deal, EscrowState.AWAITING_DELIVERY, "auto-release");
 
     // Verify no dispute is active
     if (deal.disputeStartTime > 0n) {
@@ -2093,10 +2294,8 @@ export class PalindromeEscrowSDK {
 
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    // Verify caller is arbiter
-    if (!addressEquals(walletClient.account.address, deal.arbiter)) {
-      throw new SDKError("Only arbiter can submit decision", SDKErrorCode.NOT_ARBITER);
-    }
+    // Verify caller using helper
+    this.verifyArbiter(walletClient.account.address, deal);
 
     // Sign wallet authorization
     const arbiterWalletSig = await this.signWalletAuthorization(
@@ -2250,7 +2449,24 @@ export class PalindromeEscrowSDK {
   // ==========================================================================
 
   /**
-   * Get escrow status label
+   * Get a human-readable status label with color and description for an escrow state.
+   * This is useful for displaying escrow status in UIs.
+   *
+   * @param state - The escrow state enum value
+   * @returns An object containing:
+   *   - label: Human-readable status name
+   *   - color: Suggested UI color (orange, blue, red, green, gray)
+   *   - description: Detailed explanation of what this state means
+   *
+   * @example
+   * ```typescript
+   * const sdk = new PalindromeEscrowSDK(...);
+   * const escrow = await sdk.getEscrowByIdParsed(1n);
+   * const status = sdk.getStatusLabel(escrow.state);
+   * console.log(status.label); // "Awaiting Payment"
+   * console.log(status.color); // "orange"
+   * console.log(status.description); // "Buyer needs to deposit funds"
+   * ```
    */
   getStatusLabel(state: EscrowState): { label: string; color: string; description: string } {
     const labels: Record<EscrowState, { label: string; color: string; description: string }> = {
@@ -2524,22 +2740,25 @@ export class PalindromeEscrowSDK {
     try {
       await this.publicClient.getBlockNumber();
       rpcConnected = true;
-    } catch (e: any) {
-      errors.push(`RPC error: ${e?.message}`);
+    } catch (e: unknown) {
+      const message = this.extractErrorMessage(e);
+      errors.push(`RPC error: ${message}`);
     }
 
     try {
       await this.getNextEscrowId();
       contractDeployed = true;
-    } catch (e: any) {
-      errors.push(`Contract error: ${e?.message}`);
+    } catch (e: unknown) {
+      const message = this.extractErrorMessage(e);
+      errors.push(`Contract error: ${message}`);
     }
 
     try {
       await this.getEscrows();
       subgraphConnected = true;
-    } catch (e: any) {
-      errors.push(`Subgraph error: ${e?.message}`);
+    } catch (e: unknown) {
+      const message = this.extractErrorMessage(e);
+      errors.push(`Subgraph error: ${message}`);
     }
 
     return { rpcConnected, contractDeployed, subgraphConnected, errors };
@@ -2646,7 +2865,16 @@ export class PalindromeEscrowSDK {
       fromBlock: options?.fromBlock,
       onLogs: (logs) => {
         for (const log of logs) {
-          const args = (log as any).args as EscrowCreatedEvent;
+          type ParsedLog = {
+            args?: EscrowCreatedEvent;
+          };
+
+          const parsedLog = log as unknown as ParsedLog;
+          if (!parsedLog.args) {
+            continue; // Skip logs without args
+          }
+          const args = parsedLog.args;
+
           if (
             addressEquals(args.buyer, userAddress) ||
             addressEquals(args.seller, userAddress)
@@ -2669,7 +2897,7 @@ export class PalindromeEscrowSDK {
     options?: { pollingInterval?: number },
   ): { dispose: () => void } {
     let lastState: EscrowState | null = null;
-    const interval = options?.pollingInterval ?? 5000;
+    const interval = options?.pollingInterval ?? DEFAULT_POLLING_INTERVAL;
 
     const poll = async () => {
       try {
@@ -2678,10 +2906,11 @@ export class PalindromeEscrowSDK {
           callback(deal.state, lastState);
         }
         lastState = deal.state;
-      } catch (e: any) {
+      } catch (e: unknown) {
+        const message = this.extractErrorMessage(e);
         this.log('error', 'Error polling escrow state', {
           escrowId: escrowId.toString(),
-          error: e?.message
+          error: message
         });
       }
     };
@@ -2826,6 +3055,515 @@ export class PalindromeEscrowSDK {
     return Array.from(escrowMap.values());
   }
 
+  // ============================================================================
+  // STATE & ROLE VALIDATION HELPERS
+  // ============================================================================
+
+  /**
+   * Check if a user can deposit to an escrow.
+   * A user can deposit if:
+   * - The escrow exists and is in AWAITING_PAYMENT state
+   * - The user is either the buyer or seller
+   *
+   * @param userAddress - The address of the user to check
+   * @param escrowId - The escrow ID to check
+   * @returns True if the user can deposit, false otherwise
+   */
+  async canUserDeposit(userAddress: Address, escrowId: bigint): Promise<boolean> {
+    try {
+      const escrow = await this.getEscrowByIdParsed(escrowId);
+
+      // Must be in AWAITING_PAYMENT state
+      if (escrow.state !== EscrowState.AWAITING_PAYMENT) {
+        return false;
+      }
+
+      // Must be buyer or seller
+      return addressEquals(userAddress, escrow.buyer) ||
+             addressEquals(userAddress, escrow.seller);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if a user can accept an escrow (seller accepting after buyer deposit).
+   * A user can accept if:
+   * - The escrow is in AWAITING_DELIVERY state
+   * - The user is the seller
+   *
+   * @param userAddress - The address of the user to check
+   * @param escrowId - The escrow ID to check
+   * @returns True if the user can accept, false otherwise
+   */
+  async canUserAcceptEscrow(userAddress: Address, escrowId: bigint): Promise<boolean> {
+    try {
+      const escrow = await this.getEscrowByIdParsed(escrowId);
+
+      // Must be in AWAITING_DELIVERY state
+      if (escrow.state !== EscrowState.AWAITING_DELIVERY) {
+        return false;
+      }
+
+      // Must be seller
+      return addressEquals(userAddress, escrow.seller);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if a user can confirm delivery (buyer confirming receipt).
+   * A user can confirm delivery if:
+   * - The escrow is in AWAITING_DELIVERY or DISPUTED state
+   * - The user is the buyer
+   *
+   * @param userAddress - The address of the user to check
+   * @param escrowId - The escrow ID to check
+   * @returns True if the user can confirm delivery, false otherwise
+   */
+  async canUserConfirmDelivery(userAddress: Address, escrowId: bigint): Promise<boolean> {
+    try {
+      const escrow = await this.getEscrowByIdParsed(escrowId);
+
+      // Must be in AWAITING_DELIVERY or DISPUTED state
+      if (escrow.state !== EscrowState.AWAITING_DELIVERY &&
+          escrow.state !== EscrowState.DISPUTED) {
+        return false;
+      }
+
+      // Must be buyer
+      return addressEquals(userAddress, escrow.buyer);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if a user can start a dispute.
+   * A user can start a dispute if:
+   * - The escrow is in AWAITING_DELIVERY state
+   * - The escrow has an arbiter set
+   * - The user is either the buyer or seller
+   *
+   * @param userAddress - The address of the user to check
+   * @param escrowId - The escrow ID to check
+   * @returns True if the user can start a dispute, false otherwise
+   */
+  async canUserStartDispute(userAddress: Address, escrowId: bigint): Promise<boolean> {
+    try {
+      const escrow = await this.getEscrowByIdParsed(escrowId);
+
+      // Must be in AWAITING_DELIVERY state
+      if (escrow.state !== EscrowState.AWAITING_DELIVERY) {
+        return false;
+      }
+
+      // Must have arbiter
+      if (!this.hasArbiter(escrow)) {
+        return false;
+      }
+
+      // Must be buyer or seller
+      return addressEquals(userAddress, escrow.buyer) ||
+             addressEquals(userAddress, escrow.seller);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if an escrow can be withdrawn (auto-release check).
+   * An escrow can be withdrawn if:
+   * - It's in AWAITING_DELIVERY state
+   * - The maturity time has passed (if deadline is set)
+   *
+   * @param escrowId - The escrow ID to check
+   * @returns True if the escrow can be withdrawn, false otherwise
+   */
+  async canUserWithdraw(escrowId: bigint): Promise<boolean> {
+    try {
+      const escrow = await this.getEscrowByIdParsed(escrowId);
+
+      // Must be in AWAITING_DELIVERY state
+      if (escrow.state !== EscrowState.AWAITING_DELIVERY) {
+        return false;
+      }
+
+      // Check if maturity time has passed (if deadline is set)
+      if (escrow.maturityTime > 0n) {
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        return now >= escrow.maturityTime;
+      }
+
+      // No deadline set, cannot auto-withdraw
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if a seller can perform auto-release.
+   * A seller can auto-release if:
+   * - The escrow is in AWAITING_DELIVERY state
+   * - The maturity time has passed (if deadline is set)
+   * - The user is the seller
+   *
+   * @param userAddress - The address of the user to check
+   * @param escrowId - The escrow ID to check
+   * @returns True if the seller can auto-release, false otherwise
+   */
+  async canSellerAutoRelease(userAddress: Address, escrowId: bigint): Promise<boolean> {
+    try {
+      const escrow = await this.getEscrowByIdParsed(escrowId);
+
+      // Must be seller
+      if (!addressEquals(userAddress, escrow.seller)) {
+        return false;
+      }
+
+      // Must be in AWAITING_DELIVERY state
+      if (escrow.state !== EscrowState.AWAITING_DELIVERY) {
+        return false;
+      }
+
+      // Check if maturity time has passed (if deadline is set)
+      if (escrow.maturityTime > 0n) {
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        return now >= escrow.maturityTime;
+      }
+
+      // No deadline set, cannot auto-release
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if an address is the buyer in an escrow.
+   *
+   * @param userAddress - The address to check
+   * @param escrow - The escrow data
+   * @returns True if the address is the buyer
+   */
+  isBuyer(userAddress: Address, escrow: EscrowData): boolean {
+    return addressEquals(userAddress, escrow.buyer);
+  }
+
+  /**
+   * Check if an address is the seller in an escrow.
+   *
+   * @param userAddress - The address to check
+   * @param escrow - The escrow data
+   * @returns True if the address is the seller
+   */
+  isSeller(userAddress: Address, escrow: EscrowData): boolean {
+    return addressEquals(userAddress, escrow.seller);
+  }
+
+  /**
+   * Check if an address is the arbiter in an escrow.
+   *
+   * @param userAddress - The address to check
+   * @param escrow - The escrow data
+   * @returns True if the address is the arbiter
+   */
+  isArbiter(userAddress: Address, escrow: EscrowData): boolean {
+    return addressEquals(userAddress, escrow.arbiter);
+  }
+
+  /**
+   * Check if an escrow has an arbiter set.
+   *
+   * @param escrow - The escrow data
+   * @returns True if the escrow has an arbiter (non-zero address)
+   */
+  hasArbiter(escrow: EscrowData): boolean {
+    return escrow.arbiter !== zeroAddress;
+  }
+
+  /**
+   * Compare two addresses for equality (case-insensitive, normalized).
+   * This is a public utility method that can be used to compare Ethereum addresses.
+   *
+   * @param a - First address to compare
+   * @param b - Second address to compare
+   * @returns True if the addresses are equal (case-insensitive)
+   *
+   * @example
+   * ```typescript
+   * const sdk = new PalindromeEscrowSDK(...);
+   * const areEqual = sdk.addressEquals(
+   *   "0xabc...",
+   *   "0xABC..."
+   * ); // true
+   * ```
+   */
+  addressEquals(a: Address | string, b: Address | string): boolean {
+    return addressEquals(a, b);
+  }
+
+  // ============================================================================
+  // GAS ESTIMATION HELPERS
+  // ============================================================================
+
+  /**
+   * Get current gas price information from the network.
+   * Returns standard, fast, and instant gas price estimates in gwei.
+   *
+   * @returns Object containing gas price estimates
+   *
+   * @example
+   * ```typescript
+   * const gasPrice = await sdk.getCurrentGasPrice();
+   * console.log(`Standard: ${gasPrice.standard} gwei`);
+   * console.log(`Fast: ${gasPrice.fast} gwei`);
+   * console.log(`Instant: ${gasPrice.instant} gwei`);
+   * ```
+   */
+  async getCurrentGasPrice(): Promise<{
+    standard: bigint;
+    fast: bigint;
+    instant: bigint;
+    wei: bigint;
+  }> {
+    const gasPrice = await this.publicClient.getGasPrice();
+
+    // Estimate different speed tiers (standard, fast, instant)
+    // Standard: base price
+    // Fast: +20%
+    // Instant: +50%
+    const standard = gasPrice;
+    const fast = (gasPrice * 120n) / 100n;
+    const instant = (gasPrice * 150n) / 100n;
+
+    return {
+      standard,
+      fast,
+      instant,
+      wei: gasPrice
+    };
+  }
+
+  /**
+   * Estimate gas cost for creating an escrow.
+   *
+   * @param params - Create escrow parameters
+   * @returns Gas estimation details
+   *
+   * @example
+   * ```typescript
+   * const estimate = await sdk.estimateGasForCreateEscrow({
+   *   token: tokenAddress,
+   *   buyer: buyerAddress,
+   *   amount: 1000000n,
+   *   maturityDays: 7n,
+   *   arbiter: zeroAddress,
+   *   title: 'Test',
+   *   ipfsHash: ''
+   * });
+   * console.log(`Gas limit: ${estimate.gasLimit}`);
+   * console.log(`Cost: ${estimate.estimatedCostEth} ETH`);
+   * ```
+   */
+  async estimateGasForCreateEscrow(params: {
+    token: Address;
+    buyer: Address;
+    amount: bigint;
+    maturityDays: bigint;
+    arbiter: Address;
+    title: string;
+    ipfsHash: string;
+  }): Promise<{
+    gasLimit: bigint;
+    estimatedCostWei: bigint;
+    estimatedCostEth: string;
+  }> {
+    if (!this.walletClient) {
+      throw new Error('Wallet client required for gas estimation');
+    }
+
+    try {
+      const gasLimit = await this.publicClient.estimateContractGas({
+        address: this.contractAddress,
+        abi: this.abiEscrow,
+        functionName: 'createEscrow',
+        args: [
+          params.token,
+          params.buyer,
+          params.amount,
+          params.maturityDays,
+          params.arbiter,
+          params.title,
+          params.ipfsHash,
+          pad('0x00', { size: 65 }) // Empty seller wallet sig
+        ],
+        account: this.walletClient.account
+      });
+
+      const gasPrice = await this.publicClient.getGasPrice();
+      const estimatedCostWei = gasLimit * gasPrice;
+      const estimatedCostEth = (Number(estimatedCostWei) / 1e18).toFixed(6);
+
+      return {
+        gasLimit,
+        estimatedCostWei,
+        estimatedCostEth
+      };
+    } catch (error: unknown) {
+      // If estimation fails, return conservative estimate
+      const gasLimit = 300000n; // Conservative estimate
+      const gasPrice = await this.publicClient.getGasPrice();
+      const estimatedCostWei = gasLimit * gasPrice;
+      const estimatedCostEth = (Number(estimatedCostWei) / 1e18).toFixed(6);
+
+      return {
+        gasLimit,
+        estimatedCostWei,
+        estimatedCostEth
+      };
+    }
+  }
+
+  /**
+   * Estimate gas cost for depositing to an escrow.
+   *
+   * @param escrowId - The escrow ID
+   * @returns Gas estimation details
+   *
+   * @example
+   * ```typescript
+   * const estimate = await sdk.estimateGasForDeposit(escrowId);
+   * console.log(`Gas limit: ${estimate.gasLimit}`);
+   * ```
+   */
+  async estimateGasForDeposit(escrowId: bigint): Promise<{
+    gasLimit: bigint;
+    estimatedCostWei: bigint;
+    estimatedCostEth: string;
+  }> {
+    if (!this.walletClient) {
+      throw new Error('Wallet client required for gas estimation');
+    }
+
+    try {
+      const gasLimit = await this.publicClient.estimateContractGas({
+        address: this.contractAddress,
+        abi: this.abiEscrow,
+        functionName: 'deposit',
+        args: [escrowId, pad('0x00', { size: 65 })],
+        account: this.walletClient.account
+      });
+
+      const gasPrice = await this.publicClient.getGasPrice();
+      const estimatedCostWei = gasLimit * gasPrice;
+      const estimatedCostEth = (Number(estimatedCostWei) / 1e18).toFixed(6);
+
+      return {
+        gasLimit,
+        estimatedCostWei,
+        estimatedCostEth
+      };
+    } catch {
+      const gasLimit = 200000n;
+      const gasPrice = await this.publicClient.getGasPrice();
+      const estimatedCostWei = gasLimit * gasPrice;
+      const estimatedCostEth = (Number(estimatedCostWei) / 1e18).toFixed(6);
+
+      return {
+        gasLimit,
+        estimatedCostWei,
+        estimatedCostEth
+      };
+    }
+  }
+
+  /**
+   * Estimate gas cost for confirming delivery.
+   *
+   * @param escrowId - The escrow ID
+   * @returns Gas estimation details
+   *
+   * @example
+   * ```typescript
+   * const estimate = await sdk.estimateGasForConfirmDelivery(escrowId);
+   * console.log(`Cost: ${estimate.estimatedCostEth} ETH`);
+   * ```
+   */
+  async estimateGasForConfirmDelivery(escrowId: bigint): Promise<{
+    gasLimit: bigint;
+    estimatedCostWei: bigint;
+    estimatedCostEth: string;
+  }> {
+    if (!this.walletClient) {
+      throw new Error('Wallet client required for gas estimation');
+    }
+
+    try {
+      const gasLimit = await this.publicClient.estimateContractGas({
+        address: this.contractAddress,
+        abi: this.abiEscrow,
+        functionName: 'confirmDelivery',
+        args: [escrowId, pad('0x00', { size: 65 })],
+        account: this.walletClient.account
+      });
+
+      const gasPrice = await this.publicClient.getGasPrice();
+      const estimatedCostWei = gasLimit * gasPrice;
+      const estimatedCostEth = (Number(estimatedCostWei) / 1e18).toFixed(6);
+
+      return {
+        gasLimit,
+        estimatedCostWei,
+        estimatedCostEth
+      };
+    } catch {
+      const gasLimit = 150000n;
+      const gasPrice = await this.publicClient.getGasPrice();
+      const estimatedCostWei = gasLimit * gasPrice;
+      const estimatedCostEth = (Number(estimatedCostWei) / 1e18).toFixed(6);
+
+      return {
+        gasLimit,
+        estimatedCostWei,
+        estimatedCostEth
+      };
+    }
+  }
+
+  /**
+   * Estimate gas cost for withdrawing from escrow wallet.
+   *
+   * @returns Gas estimation details
+   *
+   * @example
+   * ```typescript
+   * const estimate = await sdk.estimateGasForWithdraw();
+   * ```
+   */
+  async estimateGasForWithdraw(): Promise<{
+    gasLimit: bigint;
+    estimatedCostWei: bigint;
+    estimatedCostEth: string;
+  }> {
+    const gasLimit = 100000n; // Withdraw is typically cheaper
+    const gasPrice = await this.publicClient.getGasPrice();
+    const estimatedCostWei = gasLimit * gasPrice;
+    const estimatedCostEth = (Number(estimatedCostWei) / 1e18).toFixed(6);
+
+    return {
+      gasLimit,
+      estimatedCostWei,
+      estimatedCostEth
+    };
+  }
+
+  // ============================================================================
+  // FEE UTILITIES
+  // ============================================================================
+
   /**
    * Get fee receiver address (cached - rarely changes)
    * @param forceRefresh - Set to true to bypass cache and fetch fresh value
@@ -2866,10 +3604,11 @@ export class PalindromeEscrowSDK {
       }) as bigint;
       this.cachedFeeBps = feeBps;
       return feeBps;
-    } catch (e: any) {
+    } catch (e: unknown) {
       // Fall back to default if not readable (private constant)
+      const message = this.extractErrorMessage(e);
       this.log('warn', 'Could not read FEE_BPS from contract, using default', {
-        error: e?.message
+        error: message
       });
       this.cachedFeeBps = 100n; // 1% fee
       return this.cachedFeeBps;

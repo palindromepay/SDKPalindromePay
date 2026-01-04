@@ -1,19 +1,44 @@
 {
-  "name": "@palindromecryptoescrow/sdk",
-  "version": "1.9.3",
-  "description": "",
+  "name": "@palindromepay/sdk",
+  "version": "1.9.4",
+  "description": "TypeScript SDK for PalindromeCryptoEscrow - Secure blockchain escrow with buyer/seller protection",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "ts-node tests/testCore.ts && ts-node tests/testSecurity.ts",
+    "test:core": "ts-node tests/testCore.ts",
+    "test:security": "ts-node tests/testSecurity.ts",
+    "prepublishOnly": "npm test && npm run build",
+    "version": "npm run build",
+    "clean": "rm -rf dist"
   },
   "keywords": [
-    "Crypto",
-    "Escrow",
-    "Payment"
+    "escrow",
+    "crypto",
+    "ethereum",
+    "blockchain",
+    "smart-contract",
+    "payment",
+    "web3",
+    "typescript",
+    "viem"
   ],
-  "author": "",
+  "author": "Palindrome Finance",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/palindrome-finance/escrow-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/palindrome-finance/escrow-sdk/issues"
+  },
+  "homepage": "https://github.com/palindrome-finance/escrow-sdk#readme",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "commonjs",
   "dependencies": {
     "@babel/generator": "^7.28.3",
