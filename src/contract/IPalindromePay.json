@@ -1,7 +1,7 @@
 {
   "_format": "hh3-artifact-1",
-  "contractName": "IPalindromeCryptoEscrow",
-  "sourceName": "contracts/PalindromeEscrowWallet.sol",
+  "contractName": "IPalindromePay",
+  "sourceName": "contracts/PalindromePayWallet.sol",
   "abi": [
     {
       "inputs": [],
@@ -74,7 +74,7 @@
               "type": "uint256"
             },
             {
-              "internalType": "enum IPalindromeCryptoEscrow.State",
+              "internalType": "enum IPalindromePay.State",
               "name": "state",
               "type": "uint8"
             },
@@ -109,7 +109,7 @@
               "type": "bytes"
             }
           ],
-          "internalType": "struct IPalindromeCryptoEscrow.EscrowDeal",
+          "internalType": "struct IPalindromePay.EscrowDeal",
           "name": "",
           "type": "tuple"
         }
@@ -123,6 +123,6 @@
   "linkReferences": {},
   "deployedLinkReferences": {},
   "immutableReferences": {},
-  "inputSourceName": "project/contracts/PalindromeEscrowWallet.sol",
-  "buildInfoId": "solc-0_8_29-e195d8352b40c7816b4e75079e9474a4c2c24785"
+  "inputSourceName": "project/contracts/PalindromePayWallet.sol",
+  "buildInfoId": "solc-0_8_29-ac7efe6dec024ae99366bc2df99af957ef433f3d"
 }

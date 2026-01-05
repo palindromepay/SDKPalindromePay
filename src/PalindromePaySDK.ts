@@ -1,10 +1,8 @@
-// Copyright (c) 2025 Palindrome Finance
+// Copyright (c) 2025 Palindrome Pay
 // Licensed under the MIT License. See LICENSE file for details.
 
 /**
- * PALINDROME CRYPTO ESCROW SDK
- * 
- * Corrected and optimized SDK matching the actual smart contract interfaces.
+ * PALINDROME Pay SDK
  * 
  * Key contract functions:
  * - createEscrow(token, buyer, amount, maturityDays, arbiter, title, ipfsHash, sellerWalletSig)
@@ -44,8 +42,8 @@ import {
   TransactionReceipt,
 } from "viem";
 import { readContract, multicall } from "viem/actions";
-import PalindromeCryptoEscrowABI from "./contract/PalindromeCryptoEscrow.json";
-import PalindromeEscrowWalletABI from "./contract/PalindromeEscrowWallet.json";
+import PalindromePayABI from "./contract/PalindromePay.json";
+import PalindromePayWalletABI from "./contract/PalindromePayWallet.json";
 import ERC20ABI from "./contract/USDT.json";
 import { ApolloClient, InMemoryCache, HttpLink } from "@apollo/client";
 
@@ -128,10 +126,10 @@ const defaultLogger: SDKLogger = {
 
 /** No-op logger (disables all logging) */
 const noOpLogger: SDKLogger = {
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
+  debug: () => { },
+  info: () => { },
+  warn: () => { },
+  error: () => { },
 };
 
 // ==========================================================================
@@ -244,7 +242,7 @@ export class SDKError extends Error {
 // INTERFACES
 // ============================================================================
 
-export interface PalindromeEscrowSDKConfig {
+export interface PalindromePaySDKConfig {
   publicClient: PublicClient;
   contractAddress: Address;
   walletClient?: EscrowWalletClient;
@@ -432,7 +430,7 @@ function addressEquals(a: Address | string, b: Address | string): boolean {
 // MAIN SDK CLASS
 // ============================================================================
 
-export class PalindromeEscrowSDK {
+export class PalindromePaySDK {
   readonly contractAddress: Address;
   readonly abiEscrow: Abi;
   readonly abiWallet: Abi;
@@ -473,14 +471,14 @@ export class PalindromeEscrowSDK {
     "CANCELED",
   ] as const;
 
-  constructor(config: PalindromeEscrowSDKConfig) {
+  constructor(config: PalindromePaySDKConfig) {
     if (!config.contractAddress) {
       throw new SDKError("contractAddress is required", SDKErrorCode.VALIDATION_ERROR);
     }
 
     this.contractAddress = config.contractAddress;
-    this.abiEscrow = PalindromeCryptoEscrowABI.abi as Abi;
-    this.abiWallet = PalindromeEscrowWalletABI.abi as Abi;
+    this.abiEscrow = PalindromePayABI.abi as Abi;
+    this.abiWallet = PalindromePayWalletABI.abi as Abi;
     this.abiERC20 = ERC20ABI.abi as Abi;
     this.publicClient = config.publicClient;
     this.walletClient = config.walletClient;
@@ -844,7 +842,7 @@ export class PalindromeEscrowSDK {
    */
   private getWalletDomain(walletAddress: Address) {
     return {
-      name: "PalindromeEscrowWallet",
+      name: "PalindromePayWallet",
       version: "1",
       chainId: this.chain.id,
       verifyingContract: walletAddress,
@@ -1040,7 +1038,7 @@ export class PalindromeEscrowSDK {
     // Note: For accurate prediction, need actual bytecode + args hash
     // This is a simplified version - in production, use the contract's computation
     const initCodeHash = keccak256(
-      (PalindromeEscrowWalletABI.bytecode + encodedArgs.slice(2)) as Hex
+      (PalindromePayWalletABI.bytecode + encodedArgs.slice(2)) as Hex
     );
 
     const raw = keccak256(
@@ -1162,7 +1160,7 @@ export class PalindromeEscrowSDK {
     // Start with word 0 (nonces 0-255)
     let wordIndex = 0n;
 
-    while (wordIndex < PalindromeEscrowSDK.MAX_NONCE_WORDS) {
+    while (wordIndex < PalindromePaySDK.MAX_NONCE_WORDS) {
       const bitmap = await this.getNonceBitmap(escrowId, signer, wordIndex);
 
       // If bitmap is all 1s (all NONCE_BITMAP_SIZE nonces used), check next word
@@ -1198,7 +1196,7 @@ export class PalindromeEscrowSDK {
   private getEstimatedWordCount(count: number): number {
     return Math.min(
       Math.ceil(count / 128) + 1, // Conservative estimate with buffer
-      Number(PalindromeEscrowSDK.MAX_NONCE_WORDS)
+      Number(PalindromePaySDK.MAX_NONCE_WORDS)
     );
   }
 
@@ -2460,7 +2458,7 @@ export class PalindromeEscrowSDK {
    *
    * @example
    * ```typescript
-   * const sdk = new PalindromeEscrowSDK(...);
+   * const sdk = new PalindromePaySDK(...);
    * const escrow = await sdk.getEscrowByIdParsed(1n);
    * const status = sdk.getStatusLabel(escrow.state);
    * console.log(status.label); // "Awaiting Payment"
@@ -3080,7 +3078,7 @@ export class PalindromeEscrowSDK {
 
       // Must be buyer or seller
       return addressEquals(userAddress, escrow.buyer) ||
-             addressEquals(userAddress, escrow.seller);
+        addressEquals(userAddress, escrow.seller);
     } catch {
       return false;
     }
@@ -3128,7 +3126,7 @@ export class PalindromeEscrowSDK {
 
       // Must be in AWAITING_DELIVERY or DISPUTED state
       if (escrow.state !== EscrowState.AWAITING_DELIVERY &&
-          escrow.state !== EscrowState.DISPUTED) {
+        escrow.state !== EscrowState.DISPUTED) {
         return false;
       }
 
@@ -3166,7 +3164,7 @@ export class PalindromeEscrowSDK {
 
       // Must be buyer or seller
       return addressEquals(userAddress, escrow.buyer) ||
-             addressEquals(userAddress, escrow.seller);
+        addressEquals(userAddress, escrow.seller);
     } catch {
       return false;
     }
@@ -3294,7 +3292,7 @@ export class PalindromeEscrowSDK {
    *
    * @example
    * ```typescript
-   * const sdk = new PalindromeEscrowSDK(...);
+   * const sdk = new PalindromePaySDK(...);
    * const areEqual = sdk.addressEquals(
    *   "0xabc...",
    *   "0xABC..."
@@ -3632,4 +3630,4 @@ export class PalindromeEscrowSDK {
 // EXPORT DEFAULT
 // ============================================================================
 
-export default PalindromeEscrowSDK;
+export default PalindromePaySDK;

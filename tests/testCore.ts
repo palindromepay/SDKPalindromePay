@@ -1,5 +1,5 @@
 /**
- * PalindromeEscrowSDK – COMPREHENSIVE Production Test Suite
+ * PalindromePaySDK – COMPREHENSIVE Production Test Suite
  * 
  * Matches smart contract test coverage (escrow.test.ts, coverage.test.ts, security.test.ts)
  * Uses contract's getNonceBitmap for nonce tracking
@@ -19,12 +19,12 @@ import { ApolloClient, HttpLink, InMemoryCache } from "@apollo/client/core";
 import assert from "assert";
 
 import {
-    PalindromeEscrowSDK,
+    PalindromePaySDK,
     Role,
     DisputeResolution,
     SDKErrorCode,
     EscrowState,
-} from "../src/PalindromeEscrowSDK";
+} from "../src/PalindromePaySDK";
 
 // ════════════════════════════════════════════════════════════════════════════
 // ENV & CLIENTS
@@ -87,7 +87,7 @@ const apollo = new ApolloClient({
     cache: new InMemoryCache(),
 });
 
-const sdk = new PalindromeEscrowSDK({
+const sdk = new PalindromePaySDK({
     publicClient,
     contractAddress,
     walletClient: buyerWalletClient,
@@ -1025,7 +1025,7 @@ async function testWarnings_TokenCompatibility() {
 async function run() {
     console.log("\n");
     console.log("╔══════════════════════════════════════════════════════════════════════╗");
-    console.log("║   PALINDROME ESCROW SDK - COMPREHENSIVE TEST SUITE (90%+ COVERAGE)   ║");
+    console.log("║     PALINDROME PAY SDK - COMPREHENSIVE TEST SUITE (90%+ COVERAGE)    ║");
     console.log("╚══════════════════════════════════════════════════════════════════════╝");
 
     const startTime = Date.now();

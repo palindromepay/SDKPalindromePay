@@ -1,5 +1,5 @@
 /**
- * PalindromeEscrowSDK – SECURITY TEST SUITE
+ * PalindromePaySDK – SECURITY TEST SUITE
  * 
  * Comprehensive security tests covering:
  * - Role enforcement (buyer, seller, arbiter restrictions)
@@ -28,12 +28,12 @@ import { ApolloClient, HttpLink, InMemoryCache } from "@apollo/client/core";
 import assert from "assert";
 
 import {
-    PalindromeEscrowSDK,
+    PalindromePaySDK,
     Role,
     DisputeResolution,
     SDKErrorCode,
     EscrowState,
-} from "../src/PalindromeEscrowSDK";
+} from "../src/PalindromePaySDK";
 
 // ════════════════════════════════════════════════════════════════════════════
 // ENV & CLIENTS
@@ -106,7 +106,7 @@ const apollo = new ApolloClient({
     cache: new InMemoryCache(),
 });
 
-const sdk = new PalindromeEscrowSDK({
+const sdk = new PalindromePaySDK({
     publicClient,
     contractAddress,
     walletClient: buyerWalletClient,
@@ -1004,7 +1004,7 @@ async function testNonce_GetMultipleNonces() {
 async function run() {
     console.log("\n");
     console.log("╔══════════════════════════════════════════════════════════════════════╗");
-    console.log("║        PALINDROME ESCROW SDK - SECURITY TEST SUITE                   ║");
+    console.log("║          PALINDROME PAY SDK - SECURITY TEST SUITE                    ║");
     console.log("╚══════════════════════════════════════════════════════════════════════╝");
 
     const startTime = Date.now();
