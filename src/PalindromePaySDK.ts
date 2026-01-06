@@ -28,15 +28,11 @@ import {
   WalletClient,
   Hex,
   encodeFunctionData,
-  decodeAbiParameters,
   parseEventLogs,
   Transport,
   Account,
   Chain,
-  keccak256,
   pad,
-  toBytes,
-  encodeAbiParameters,
   getAddress,
   zeroAddress,
   TransactionReceipt,
@@ -457,7 +453,6 @@ export class PalindromePaySDK {
   /** Cache for token decimals (rarely changes, no eviction needed) */
   private tokenDecimalsCache: Map<Address, number> = new Map();
   /** Cache for immutable contract values */
-  private walletBytecodeHashCache: Hex | null = null;
   private feeReceiverCache: Address | null = null;
   /** Cached multicall support status per chain (null = not yet detected) */
   private multicallSupported: boolean | null = null;
@@ -1018,34 +1013,16 @@ export class PalindromePaySDK {
    * Predict the wallet address for a given escrow ID (before creation)
    */
   async predictWalletAddress(escrowId: bigint): Promise<Address> {
-    const salt = keccak256(pad(toBytes(escrowId), { size: 32 }));
+    // Use the contract's computeWalletAddress function for accurate prediction
+    // This ensures the SDK always matches the contract's CREATE2 computation
+    const walletAddress = await this.publicClient.readContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: "computeWalletAddress",
+      args: [escrowId],
+    }) as Address;
 
-    // Get wallet bytecode hash from contract (cached - immutable value)
-    if (!this.walletBytecodeHashCache) {
-      this.walletBytecodeHashCache = await this.publicClient.readContract({
-        address: this.contractAddress,
-        abi: this.abiEscrow,
-        functionName: "WALLET_BYTECODE_HASH",
-      }) as Hex;
-    }
-
-    // Compute CREATE2 address
-    const encodedArgs = encodeAbiParameters(
-      [{ type: "address" }, { type: "uint256" }],
-      [this.contractAddress, escrowId],
-    );
-
-    // Note: For accurate prediction, need actual bytecode + args hash
-    // This is a simplified version - in production, use the contract's computation
-    const initCodeHash = keccak256(
-      (PalindromePayWalletABI.bytecode + encodedArgs.slice(2)) as Hex
-    );
-
-    const raw = keccak256(
-      (`0xff${this.contractAddress.slice(2)}${salt.slice(2)}${initCodeHash.slice(2)}`) as Hex
-    );
-
-    return getAddress(`0x${raw.slice(26)}`);
+    return walletAddress;
   }
 
   // ==========================================================================
@@ -1484,7 +1461,7 @@ export class PalindromePaySDK {
   async createEscrow(
     walletClient: EscrowWalletClient,
     params: CreateEscrowParams,
-  ): Promise<{ escrowId: bigint; txHash: Hex; walletAddress: Address }> {
+  ): Promise<{ escrowId: bigint; txHash: Hex; walletAddress: Address; signatureValid: boolean }> {
     assertWalletClient(walletClient);
 
     // Validate and normalize addresses
@@ -1523,7 +1500,22 @@ export class PalindromePaySDK {
     const nextId = await this.getNextEscrowId();
     const predictedWallet = await this.predictWalletAddress(nextId);
 
-    // Sign wallet authorization
+    // Double-check: verify prediction matches contract computation
+    const contractComputed = await this.publicClient.readContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: "computeWalletAddress",
+      args: [nextId],
+    }) as Address;
+
+    if (getAddress(predictedWallet) !== getAddress(contractComputed)) {
+      throw new SDKError(
+        `Wallet address mismatch: predicted ${predictedWallet} but contract computed ${contractComputed}`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    // Sign wallet authorization (now safe - address verified)
     const sellerWalletSig = await this.signWalletAuthorization(
       walletClient,
       predictedWallet,
@@ -1563,7 +1555,31 @@ export class PalindromePaySDK {
     const escrowId = events[0]?.args?.escrowId ?? nextId;
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    return { escrowId, txHash: hash, walletAddress: deal.wallet };
+    // Verify seller signature is valid on-chain after creation
+    let sellerSigValid = false;
+    try {
+      sellerSigValid = await this.publicClient.readContract({
+        address: deal.wallet,
+        abi: this.abiWallet,
+        functionName: "isSignatureValid",
+        args: [walletClient.account.address],
+      }) as boolean;
+    } catch (error) {
+      this.log('warn', 'Failed to verify seller signature after escrow creation', {
+        escrowId: escrowId.toString(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    if (!sellerSigValid) {
+      this.log('error', 'Seller wallet signature is invalid after escrow creation', {
+        escrowId: escrowId.toString(),
+        seller: walletClient.account.address,
+        wallet: deal.wallet,
+      });
+    }
+
+    return { escrowId, txHash: hash, walletAddress: deal.wallet, signatureValid: sellerSigValid };
   }
 
   /**
@@ -1593,7 +1609,7 @@ export class PalindromePaySDK {
   async createEscrowAndDeposit(
     walletClient: EscrowWalletClient,
     params: CreateEscrowAndDepositParams,
-  ): Promise<{ escrowId: bigint; txHash: Hex; walletAddress: Address }> {
+  ): Promise<{ escrowId: bigint; txHash: Hex; walletAddress: Address; signatureValid: boolean }> {
     assertWalletClient(walletClient);
 
     // Validate and normalize addresses
@@ -1640,7 +1656,22 @@ export class PalindromePaySDK {
     const nextId = await this.getNextEscrowId();
     const predictedWallet = await this.predictWalletAddress(nextId);
 
-    // Sign wallet authorization
+    // Double-check: verify prediction matches contract computation
+    const contractComputed = await this.publicClient.readContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: "computeWalletAddress",
+      args: [nextId],
+    }) as Address;
+
+    if (getAddress(predictedWallet) !== getAddress(contractComputed)) {
+      throw new SDKError(
+        `Wallet address mismatch: predicted ${predictedWallet} but contract computed ${contractComputed}`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    // Sign wallet authorization (now safe - address verified)
     const buyerWalletSig = await this.signWalletAuthorization(
       walletClient,
       predictedWallet,
@@ -1680,7 +1711,31 @@ export class PalindromePaySDK {
     const escrowId = events[0]?.args?.escrowId ?? nextId;
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    return { escrowId, txHash: hash, walletAddress: deal.wallet };
+    // Verify buyer signature is valid on-chain after creation
+    let buyerSigValid = false;
+    try {
+      buyerSigValid = await this.publicClient.readContract({
+        address: deal.wallet,
+        abi: this.abiWallet,
+        functionName: "isSignatureValid",
+        args: [walletClient.account.address],
+      }) as boolean;
+    } catch (error) {
+      this.log('warn', 'Failed to verify buyer signature after escrow creation', {
+        escrowId: escrowId.toString(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    if (!buyerSigValid) {
+      this.log('error', 'Buyer wallet signature is invalid after escrow creation', {
+        escrowId: escrowId.toString(),
+        buyer: walletClient.account.address,
+        wallet: deal.wallet,
+      });
+    }
+
+    return { escrowId, txHash: hash, walletAddress: deal.wallet, signatureValid: buyerSigValid };
   }
 
   // ==========================================================================
@@ -1699,7 +1754,7 @@ export class PalindromePaySDK {
    *
    * @param walletClient - The buyer's wallet client (must have account connected)
    * @param escrowId - The escrow ID to deposit into
-   * @returns Transaction hash
+   * @returns Object containing transaction hash and signature validity
    * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
    * @throws {SDKError} NOT_BUYER - If caller is not the designated buyer
    * @throws {SDKError} INVALID_STATE - If escrow is not in AWAITING_PAYMENT state
@@ -1708,7 +1763,7 @@ export class PalindromePaySDK {
   async deposit(
     walletClient: EscrowWalletClient,
     escrowId: bigint,
-  ): Promise<Hex> {
+  ): Promise<{ txHash: Hex; signatureValid: boolean }> {
     assertWalletClient(walletClient);
 
     const deal = await this.getEscrowByIdParsed(escrowId);
@@ -1725,7 +1780,22 @@ export class PalindromePaySDK {
       deal.amount,
     );
 
-    // Sign wallet authorization
+    // Verify wallet address matches contract computation
+    const contractComputed = await this.publicClient.readContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: "computeWalletAddress",
+      args: [escrowId],
+    }) as Address;
+
+    if (getAddress(deal.wallet) !== getAddress(contractComputed)) {
+      throw new SDKError(
+        `Wallet address mismatch: escrow has ${deal.wallet} but contract computed ${contractComputed}`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    // Sign wallet authorization (now safe - address verified)
     const buyerWalletSig = await this.signWalletAuthorization(
       walletClient,
       deal.wallet,
@@ -1741,7 +1811,32 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
-    return hash;
+
+    // Verify buyer signature is valid on-chain after deposit
+    let buyerSigValid = false;
+    try {
+      buyerSigValid = await this.publicClient.readContract({
+        address: deal.wallet,
+        abi: this.abiWallet,
+        functionName: "isSignatureValid",
+        args: [walletClient.account.address],
+      }) as boolean;
+    } catch (error) {
+      this.log('warn', 'Failed to verify buyer signature after deposit', {
+        escrowId: escrowId.toString(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    if (!buyerSigValid) {
+      this.log('error', 'Buyer wallet signature is invalid after deposit', {
+        escrowId: escrowId.toString(),
+        buyer: walletClient.account.address,
+        wallet: deal.wallet,
+      });
+    }
+
+    return { txHash: hash, signatureValid: buyerSigValid };
   }
 
   // ==========================================================================
@@ -1759,7 +1854,7 @@ export class PalindromePaySDK {
    *
    * @param walletClient - The seller's wallet client (must have account connected)
    * @param escrowId - The escrow ID to accept
-   * @returns Transaction hash
+   * @returns Object containing transaction hash and signature validity
    * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
    * @throws {SDKError} NOT_SELLER - If caller is not the designated seller
    * @throws {SDKError} INVALID_STATE - If escrow is not in AWAITING_DELIVERY state
@@ -1768,7 +1863,7 @@ export class PalindromePaySDK {
   async acceptEscrow(
     walletClient: EscrowWalletClient,
     escrowId: bigint,
-  ): Promise<Hex> {
+  ): Promise<{ txHash: Hex; signatureValid: boolean }> {
     assertWalletClient(walletClient);
 
     const deal = await this.getEscrowByIdParsed(escrowId);
@@ -1782,7 +1877,22 @@ export class PalindromePaySDK {
       throw new SDKError("Escrow already accepted", SDKErrorCode.ALREADY_ACCEPTED);
     }
 
-    // Sign wallet authorization
+    // Verify wallet address matches contract computation
+    const contractComputed = await this.publicClient.readContract({
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: "computeWalletAddress",
+      args: [escrowId],
+    }) as Address;
+
+    if (getAddress(deal.wallet) !== getAddress(contractComputed)) {
+      throw new SDKError(
+        `Wallet address mismatch: escrow has ${deal.wallet} but contract computed ${contractComputed}`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    // Sign wallet authorization (now safe - address verified)
     const sellerWalletSig = await this.signWalletAuthorization(
       walletClient,
       deal.wallet,
@@ -1798,7 +1908,32 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
-    return hash;
+
+    // Verify seller signature is valid on-chain after accept
+    let sellerSigValid = false;
+    try {
+      sellerSigValid = await this.publicClient.readContract({
+        address: deal.wallet,
+        abi: this.abiWallet,
+        functionName: "isSignatureValid",
+        args: [walletClient.account.address],
+      }) as boolean;
+    } catch (error) {
+      this.log('warn', 'Failed to verify seller signature after accept', {
+        escrowId: escrowId.toString(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    if (!sellerSigValid) {
+      this.log('error', 'Seller wallet signature is invalid after accept', {
+        escrowId: escrowId.toString(),
+        seller: walletClient.account.address,
+        wallet: deal.wallet,
+      });
+    }
+
+    return { txHash: hash, signatureValid: sellerSigValid };
   }
 
   // ==========================================================================
