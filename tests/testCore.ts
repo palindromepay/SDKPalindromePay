@@ -110,7 +110,7 @@ const ERC20_ABI = [
 ] as const;
 
 const ESCROW_ABI = [
-    { name: "feeReceiver", type: "function", inputs: [], outputs: [{ type: "address" }], stateMutability: "view" },
+    { name: "FEE_RECEIVER", type: "function", inputs: [], outputs: [{ type: "address" }], stateMutability: "view" },
 ] as const;
 
 const WALLET_ABI = [
@@ -198,7 +198,7 @@ async function getFeeReceiver(): Promise<Address> {
     return publicClient.readContract({
         address: contractAddress,
         abi: ESCROW_ABI,
-        functionName: "feeReceiver",
+        functionName: "FEE_RECEIVER",
         args: [],
     }) as Promise<Address>;
 }
