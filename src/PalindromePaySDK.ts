@@ -3030,15 +3030,29 @@ export class PalindromePaySDK {
   }
 
   /**
-   * Clear all caches
+   * Clear the Apollo cache. Call this when switching wallets to prevent
+   * "Store error: database unavailable" errors.
    */
-  clearAllCaches(): void {
+  async clearApolloCache(): Promise<void> {
+    try {
+      await this.apollo.clearStore();
+    } catch (error) {
+      // If clearStore fails, reset the client entirely
+      this.apollo.stop();
+      await this.apollo.resetStore();
+    }
+  }
+
+  /**
+   * Clear all caches including Apollo cache. Call when switching wallets.
+   */
+  async clearAllCaches(): Promise<void> {
     this.escrowCache.clear();
     this.tokenDecimalsCache.clear();
     this.feeReceiverCache = null;
     this.cachedFeeBps = null;
     this.multicallSupported = null;
-    // Note: walletBytecodeHashCache is immutable and never needs clearing
+    await this.clearApolloCache();
   }
 
   /**
