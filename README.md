@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@palindromepay/sdk.svg)](https://www.npmjs.com/package/@palindromepay/sdk)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Documentation](https://img.shields.io/badge/docs-sdk.palindromefinance.com-blue)](https://sdk.palindromefinance.com)
+[![Documentation](https://img.shields.io/badge/docs-sdk.palindromepay.com-blue)](https://sdk.palindromepay.com)
 
 A TypeScript/Node SDK for interacting with the PalindromePay escrow smart contract and subgraph, including signature flows, event utilities, token helpers, and robust error handling.
 
@@ -10,7 +10,7 @@ A TypeScript/Node SDK for interacting with the PalindromePay escrow smart contra
 
 ## 📚 Documentation
 
-**Full documentation available at: [sdk.palindromefinance.com](https://sdk.palindromefinance.com)**
+**Full documentation available at: [palindromepay.com/sdk](https://www.palindromepay.com/sdk)**
 
 ---
 
@@ -81,5 +81,5 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📞 Support
 
-- GitHub Issues: https://github.com/palindrome-finance/escrow-sdk/issues
-- Documentation: https://github.com/palindrome-finance/escrow-sdk#readme
+- GitHub Issues: https://github.com/palindromepay/SDKPalindromePay/issues
+- Documentation: https://www.palindromepay.com/sdk
