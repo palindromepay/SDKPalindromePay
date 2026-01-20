@@ -42,7 +42,7 @@ import { readContract, multicall } from "viem/actions";
 import PalindromePayABI from "./contract/PalindromePay.json";
 import PalindromePayWalletABI from "./contract/PalindromePayWallet.json";
 import ERC20ABI from "./contract/USDT.json";
-import { ApolloClient, InMemoryCache, HttpLink } from "@apollo/client";
+import { ApolloClient } from "@apollo/client";
 
 // ==========================================================================
 // ERROR TYPES
@@ -140,7 +140,7 @@ import {
   ESCROWS_BY_SELLER_QUERY,
   ESCROW_DETAIL_QUERY,
 } from "./subgraph/queries";
-import { Escrow } from "./types/escrow";
+import { Escrow, DisputeMessage } from "./types/escrow";
 import { hardhat } from "viem/chains";
 
 // ============================================================================
@@ -180,6 +180,9 @@ const USER_REJECTION_CODE = 4001;
 
 /** Seconds per day for maturity calculations */
 const SECONDS_PER_DAY = 86400n;
+
+/** Maximum maturity days (10 years) */
+const MAX_MATURITY_DAYS = 3650n;
 
 /** Nonce bitmap word size in bits */
 const NONCE_BITMAP_SIZE = 256;
@@ -244,7 +247,8 @@ export interface PalindromePaySDKConfig {
   publicClient: PublicClient;
   contractAddress: Address;
   walletClient?: EscrowWalletClient;
-  apolloClient?: ApolloClient;
+  /** Apollo client for subgraph queries (required) */
+  apolloClient: ApolloClient;
   chain?: Chain;
   /** Cache TTL in milliseconds (default: 5000) */
   cacheTTL?: number;
@@ -260,7 +264,6 @@ export interface PalindromePaySDKConfig {
   gasBuffer?: number;
   /** Transaction receipt timeout in milliseconds (default: 60000) */
   receiptTimeout?: number;
-  subgraphUrl?: string;
   /**
    * Skip eth_call simulation before sending transactions (default: false)
    * Enable this for chains with unreliable RPC simulation (e.g., Base Sepolia)
@@ -456,6 +459,8 @@ export class PalindromePaySDK {
   private tokenDecimalsCache: Map<Address, number> = new Map();
   /** Cache for immutable contract values */
   private feeReceiverCache: Address | null = null;
+  /** Cached default arbiter from contract (immutable) */
+  private defaultArbiterCache: Address | null = null;
   /** Cached multicall support status per chain (null = not yet detected) */
   private multicallSupported: boolean | null = null;
 
@@ -492,12 +497,10 @@ export class PalindromePaySDK {
     this.logLevel = config.logLevel ?? 'info';
     this.logger = config.logger ?? (this.logLevel === 'none' ? noOpLogger : defaultLogger);
 
-    this.apollo = config.apolloClient ?? new ApolloClient({
-      link: new HttpLink({
-        uri: config.subgraphUrl ?? "https://api.studio.thegraph.com/query/121986/palindrome-finance-subgraph/version/latest",
-      }),
-      cache: new InMemoryCache(),
-    });
+    if (!config.apolloClient) {
+      throw new SDKError("apolloClient is required", SDKErrorCode.VALIDATION_ERROR);
+    }
+    this.apollo = config.apolloClient;
   }
 
   // ==========================================================================
@@ -507,7 +510,7 @@ export class PalindromePaySDK {
   /**
    * Internal logging helper that respects log level configuration
    */
-  private log(level: Exclude<LogLevel, 'none'>, message: string, context?: any): void {
+  private log(level: Exclude<LogLevel, 'none'>, message: string, context?: Record<string, unknown>): void {
     const levels: LogLevel[] = ['debug', 'info', 'warn', 'error', 'none'];
     const currentLevelIndex = levels.indexOf(this.logLevel);
     const messageLevelIndex = levels.indexOf(level);
@@ -688,6 +691,12 @@ export class PalindromePaySDK {
     if (maturityDays < 0n) {
       throw new SDKError("Maturity days cannot be negative", SDKErrorCode.VALIDATION_ERROR);
     }
+    if (maturityDays > MAX_MATURITY_DAYS) {
+      throw new SDKError(
+        `Maturity days cannot exceed ${MAX_MATURITY_DAYS} days (10 years)`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
     if (!title || title.trim().length === 0) {
       throw new SDKError("Title cannot be empty", SDKErrorCode.VALIDATION_ERROR);
     }
@@ -703,7 +712,7 @@ export class PalindromePaySDK {
    * Verify caller is the buyer, throw if not.
    */
   private verifyBuyer(caller: Address, escrow: EscrowData): void {
-    if (caller.toLowerCase() !== escrow.buyer.toLowerCase()) {
+    if (!addressEquals(caller, escrow.buyer)) {
       throw new SDKError("Only buyer can perform this action", SDKErrorCode.NOT_BUYER);
     }
   }
@@ -712,7 +721,7 @@ export class PalindromePaySDK {
    * Verify caller is the seller, throw if not.
    */
   private verifySeller(caller: Address, escrow: EscrowData): void {
-    if (caller.toLowerCase() !== escrow.seller.toLowerCase()) {
+    if (!addressEquals(caller, escrow.seller)) {
       throw new SDKError("Only seller can perform this action", SDKErrorCode.NOT_SELLER);
     }
   }
@@ -721,7 +730,7 @@ export class PalindromePaySDK {
    * Verify caller is the arbiter, throw if not.
    */
   private verifyArbiter(caller: Address, escrow: EscrowData): void {
-    if (caller.toLowerCase() !== escrow.arbiter.toLowerCase()) {
+    if (!addressEquals(caller, escrow.arbiter)) {
       throw new SDKError("Only arbiter can perform this action", SDKErrorCode.NOT_ARBITER);
     }
   }
@@ -1492,16 +1501,28 @@ export class PalindromePaySDK {
   async createEscrow(
     walletClient: EscrowWalletClient,
     params: CreateEscrowParams,
-  ): Promise<{ escrowId: bigint; txHash: Hex; walletAddress: Address; signatureValid: boolean }> {
+  ): Promise<{ escrowId: bigint; txHash: Hex; walletAddress: Address; signatureValid: boolean; verificationError?: string }> {
     assertWalletClient(walletClient);
 
     // Validate and normalize addresses
     const token = validateAddress(params.token, "token");
     const buyer = validateAddress(params.buyer, "buyer");
-    const arbiter = params.arbiter
-      ? validateAddress(params.arbiter, "arbiter")
-      : zeroAddress;
     const sellerAddress = walletClient.account.address;
+
+    // Use default arbiter if none provided, reject zero address
+    let arbiter: Address;
+    if (params.arbiter) {
+      const validatedArbiter = validateAddress(params.arbiter, "arbiter");
+      if (isZeroAddress(validatedArbiter)) {
+        throw new SDKError(
+          "Zero address not allowed for arbiter. Omit arbiter param to use Palindrome Pay default.",
+          SDKErrorCode.VALIDATION_ERROR,
+        );
+      }
+      arbiter = validatedArbiter;
+    } else {
+      arbiter = await this.getDefaultArbiter();
+    }
     const maturityDays = params.maturityTimeDays ?? 1n;
 
     // Validate using helper
@@ -1516,13 +1537,11 @@ export class PalindromePaySDK {
     });
 
     // Validate arbiter is not buyer or seller
-    if (!isZeroAddress(arbiter)) {
-      if (getAddress(arbiter) === getAddress(buyer)) {
-        throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
-      }
-      if (getAddress(arbiter) === getAddress(sellerAddress)) {
-        throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
-      }
+    if (getAddress(arbiter) === getAddress(buyer)) {
+      throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (getAddress(arbiter) === getAddress(sellerAddress)) {
+      throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
     }
 
     const ipfsHash = params.ipfsHash ?? "";
@@ -1588,6 +1607,7 @@ export class PalindromePaySDK {
 
     // Verify seller signature is valid on-chain after creation
     let sellerSigValid = false;
+    let verificationError: string | undefined;
     try {
       sellerSigValid = await this.publicClient.readContract({
         address: deal.wallet,
@@ -1596,13 +1616,14 @@ export class PalindromePaySDK {
         args: [walletClient.account.address],
       }) as boolean;
     } catch (error) {
+      verificationError = error instanceof Error ? error.message : String(error);
       this.log('warn', 'Failed to verify seller signature after escrow creation', {
         escrowId: escrowId.toString(),
-        error: error instanceof Error ? error.message : String(error),
+        error: verificationError,
       });
     }
 
-    if (!sellerSigValid) {
+    if (!sellerSigValid && !verificationError) {
       this.log('error', 'Seller wallet signature is invalid after escrow creation', {
         escrowId: escrowId.toString(),
         seller: walletClient.account.address,
@@ -1610,7 +1631,7 @@ export class PalindromePaySDK {
       });
     }
 
-    return { escrowId, txHash: hash, walletAddress: deal.wallet, signatureValid: sellerSigValid };
+    return { escrowId, txHash: hash, walletAddress: deal.wallet, signatureValid: sellerSigValid, verificationError };
   }
 
   /**
@@ -1640,16 +1661,28 @@ export class PalindromePaySDK {
   async createEscrowAndDeposit(
     walletClient: EscrowWalletClient,
     params: CreateEscrowAndDepositParams,
-  ): Promise<{ escrowId: bigint; txHash: Hex; walletAddress: Address; signatureValid: boolean }> {
+  ): Promise<{ escrowId: bigint; txHash: Hex; walletAddress: Address; signatureValid: boolean; verificationError?: string }> {
     assertWalletClient(walletClient);
 
     // Validate and normalize addresses
     const token = validateAddress(params.token, "token");
     const seller = validateAddress(params.seller, "seller");
-    const arbiter = params.arbiter
-      ? validateAddress(params.arbiter, "arbiter")
-      : zeroAddress;
     const buyerAddress = walletClient.account.address;
+
+    // Use default arbiter if none provided, reject zero address
+    let arbiter: Address;
+    if (params.arbiter) {
+      const validatedArbiter = validateAddress(params.arbiter, "arbiter");
+      if (isZeroAddress(validatedArbiter)) {
+        throw new SDKError(
+          "Zero address not allowed for arbiter. Omit arbiter param to use Palindrome Pay default.",
+          SDKErrorCode.VALIDATION_ERROR,
+        );
+      }
+      arbiter = validatedArbiter;
+    } else {
+      arbiter = await this.getDefaultArbiter();
+    }
     const maturityDays = params.maturityTimeDays ?? 1n;
 
     // Validate using helper
@@ -1664,13 +1697,11 @@ export class PalindromePaySDK {
     });
 
     // Validate arbiter is not buyer or seller
-    if (!isZeroAddress(arbiter)) {
-      if (getAddress(arbiter) === getAddress(seller)) {
-        throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
-      }
-      if (getAddress(arbiter) === getAddress(buyerAddress)) {
-        throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
-      }
+    if (getAddress(arbiter) === getAddress(seller)) {
+      throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (getAddress(arbiter) === getAddress(buyerAddress)) {
+      throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
     }
 
     const ipfsHash = params.ipfsHash ?? "";
@@ -1744,6 +1775,7 @@ export class PalindromePaySDK {
 
     // Verify buyer signature is valid on-chain after creation
     let buyerSigValid = false;
+    let verificationError: string | undefined;
     try {
       buyerSigValid = await this.publicClient.readContract({
         address: deal.wallet,
@@ -1752,13 +1784,14 @@ export class PalindromePaySDK {
         args: [walletClient.account.address],
       }) as boolean;
     } catch (error) {
+      verificationError = error instanceof Error ? error.message : String(error);
       this.log('warn', 'Failed to verify buyer signature after escrow creation', {
         escrowId: escrowId.toString(),
-        error: error instanceof Error ? error.message : String(error),
+        error: verificationError,
       });
     }
 
-    if (!buyerSigValid) {
+    if (!buyerSigValid && !verificationError) {
       this.log('error', 'Buyer wallet signature is invalid after escrow creation', {
         escrowId: escrowId.toString(),
         buyer: walletClient.account.address,
@@ -1766,7 +1799,7 @@ export class PalindromePaySDK {
       });
     }
 
-    return { escrowId, txHash: hash, walletAddress: deal.wallet, signatureValid: buyerSigValid };
+    return { escrowId, txHash: hash, walletAddress: deal.wallet, signatureValid: buyerSigValid, verificationError };
   }
 
   // ==========================================================================
@@ -2635,7 +2668,8 @@ export class PalindromePaySDK {
     return data?.escrows ?? [];
   }
 
-  async getEscrowDetail(id: string): Promise<Escrow | undefined> {
+  async getEscrowDetail(escrowId: string | bigint): Promise<Escrow | undefined> {
+    const id = typeof escrowId === 'bigint' ? escrowId.toString() : escrowId;
     const { data } = await this.apollo.query<{ escrow: Escrow }>({
       query: ESCROW_DETAIL_QUERY,
       variables: { id },
@@ -2644,10 +2678,11 @@ export class PalindromePaySDK {
     return data?.escrow;
   }
 
-  async getDisputeMessages(escrowId: string): Promise<any[]> {
-    const { data } = await this.apollo.query<{ escrow: { disputeMessages: any[] } }>({
+  async getDisputeMessages(escrowId: string | bigint): Promise<DisputeMessage[]> {
+    const id = typeof escrowId === 'bigint' ? escrowId.toString() : escrowId;
+    const { data } = await this.apollo.query<{ escrow: { disputeMessages: DisputeMessage[] } }>({
       query: DISPUTE_MESSAGES_BY_ESCROW_QUERY,
-      variables: { escrowId },
+      variables: { escrowId: id },
       fetchPolicy: "network-only",
     });
     return data?.escrow?.disputeMessages ?? [];
@@ -2734,13 +2769,13 @@ export class PalindromePaySDK {
   async simulateTransaction(
     walletClient: EscrowWalletClient,
     functionName: string,
-    args: any[],
+    args: readonly unknown[],
     contractAddress?: Address,
   ): Promise<{
     success: boolean;
     gasEstimate?: bigint;
     revertReason?: string;
-    result?: any;
+    result?: unknown;
   }> {
     assertWalletClient(walletClient);
 
@@ -2886,12 +2921,12 @@ export class PalindromePaySDK {
         gasEstimate,
         signatureCount,
       };
-    } catch (error: any) {
+    } catch (error: unknown) {
       let revertReason = "Unknown error";
 
-      if (error?.shortMessage) {
+      if (hasShortMessage(error)) {
         revertReason = error.shortMessage;
-      } else if (error?.message) {
+      } else if (isViemError(error)) {
         revertReason = error.message.slice(0, 200);
       }
 
@@ -2909,7 +2944,7 @@ export class PalindromePaySDK {
   async estimateGasWithBuffer(
     walletClient: EscrowWalletClient,
     functionName: string,
-    args: any[],
+    args: readonly unknown[],
     contractAddress?: Address,
   ): Promise<bigint> {
     assertWalletClient(walletClient);
@@ -3050,6 +3085,7 @@ export class PalindromePaySDK {
     this.escrowCache.clear();
     this.tokenDecimalsCache.clear();
     this.feeReceiverCache = null;
+    this.defaultArbiterCache = null;
     this.cachedFeeBps = null;
     this.multicallSupported = null;
     await this.clearApolloCache();
@@ -3803,6 +3839,38 @@ export class PalindromePaySDK {
     }) as Address;
 
     return this.feeReceiverCache;
+  }
+
+  /**
+   * Check if an escrow uses the default Palindrome Pay arbiter.
+   *
+   * @param escrow - The escrow data to check
+   * @returns True if the escrow uses the default arbiter
+   */
+  async isDefaultArbiter(escrow: EscrowData): Promise<boolean> {
+    const defaultArbiter = await this.getDefaultArbiter();
+    return escrow.arbiter.toLowerCase() === defaultArbiter.toLowerCase();
+  }
+
+  /**
+   * Get the default Palindrome Pay arbiter address from contract.
+   * Result is cached since the value is immutable.
+   *
+   * @returns The default arbiter address
+   */
+  async getDefaultArbiter(): Promise<Address> {
+    if (this.defaultArbiterCache) {
+      return this.defaultArbiterCache;
+    }
+
+    const arbiter = await readContract(this.publicClient, {
+      address: this.contractAddress,
+      abi: PalindromePayABI.abi as Abi,
+      functionName: "DEFAULT_ARBITER",
+    });
+
+    this.defaultArbiterCache = arbiter as Address;
+    return this.defaultArbiterCache;
   }
 
   /** Cached fee basis points (lazily computed from contract) */

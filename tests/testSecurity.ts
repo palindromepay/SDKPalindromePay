@@ -687,32 +687,27 @@ async function testInput_ZeroAmountRejected() {
     pass("Input: Zero amount rejected");
 }
 
-async function testInput_ZeroArbiterAllowedButDisputeBlocked() {
-    section("Input: Zero arbiter allowed but dispute blocked");
+async function testInput_ZeroArbiterRejectedAtCreation() {
+    section("Input: Zero arbiter rejected at creation");
 
-    await fundAccount(buyerAccount.address);
+    await fundAccount(sellerAccount.address);
 
     log("Creating with zero arbiter...");
-    const { escrowId } = await sdk.createEscrow(sellerWalletClient, {
-        token: USDT,
-        buyer: buyerAccount.address,
-        amount: AMOUNT,
-        arbiter: "0x0000000000000000000000000000000000000000" as Address,
-        title: "Zero Arbiter Test",
-    });
-    log(`   ✅ Created escrow ${escrowId} with zero arbiter`);
-
-    await sdk.deposit(buyerWalletClient, escrowId);
-
-    log("Trying to start dispute...");
     try {
-        await sdk.startDispute(buyerWalletClient, escrowId);
-        assert.fail("Should have reverted");
+        await sdk.createEscrow(sellerWalletClient, {
+            token: USDT,
+            buyer: buyerAccount.address,
+            amount: AMOUNT,
+            arbiter: "0x0000000000000000000000000000000000000000" as Address,
+            title: "Zero Arbiter Test",
+        });
+        assert.fail("Should have thrown VALIDATION_ERROR");
     } catch (e: any) {
-        log("   ✅ Dispute blocked (zero arbiter)");
+        assert.equal(e.code, SDKErrorCode.VALIDATION_ERROR);
+        log("   ✅ Zero arbiter rejected at creation with VALIDATION_ERROR");
     }
 
-    pass("Input: Zero arbiter allowed but dispute blocked");
+    pass("Input: Zero arbiter rejected at creation");
 }
 
 async function testInput_SameBuyerSellerRejected() {
@@ -1037,7 +1032,7 @@ async function run() {
         testInput_TitleMaxLength,
         testInput_EmptyTitleRejected,
         testInput_ZeroAmountRejected,
-        testInput_ZeroArbiterAllowedButDisputeBlocked,
+        testInput_ZeroArbiterRejectedAtCreation,
         testInput_SameBuyerSellerRejected,
 
         // Dispute Security (3 tests)
