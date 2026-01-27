@@ -43,6 +43,7 @@ import PalindromePayABI from "./contract/PalindromePay.json";
 import PalindromePayWalletABI from "./contract/PalindromePayWallet.json";
 import ERC20ABI from "./contract/USDT.json";
 import { ApolloClient } from "@apollo/client";
+import { CONFIG } from "./config";
 
 // ==========================================================================
 // ERROR TYPES
@@ -245,7 +246,8 @@ export class SDKError extends Error {
 
 export interface PalindromePaySDKConfig {
   publicClient: PublicClient;
-  contractAddress: Address;
+  /** Contract address (defaults to Palindrome Pay on Base mainnet) */
+  contractAddress?: Address;
   walletClient?: EscrowWalletClient;
   /** Apollo client for subgraph queries (required) */
   apolloClient: ApolloClient;
@@ -459,8 +461,6 @@ export class PalindromePaySDK {
   private tokenDecimalsCache: Map<Address, number> = new Map();
   /** Cache for immutable contract values */
   private feeReceiverCache: Address | null = null;
-  /** Cached default arbiter from contract (immutable) */
-  private defaultArbiterCache: Address | null = null;
   /** Cached multicall support status per chain (null = not yet detected) */
   private multicallSupported: boolean | null = null;
 
@@ -474,11 +474,8 @@ export class PalindromePaySDK {
   ] as const;
 
   constructor(config: PalindromePaySDKConfig) {
-    if (!config.contractAddress) {
-      throw new SDKError("contractAddress is required", SDKErrorCode.VALIDATION_ERROR);
-    }
-
-    this.contractAddress = config.contractAddress;
+    // Use default contract address if none provided
+    this.contractAddress = config.contractAddress ?? CONFIG.DEFAULT_CONTRACT_ADDRESS;
     this.abiEscrow = PalindromePayABI.abi as Abi;
     this.abiWallet = PalindromePayWalletABI.abi as Abi;
     this.abiERC20 = ERC20ABI.abi as Abi;
@@ -1509,20 +1506,10 @@ export class PalindromePaySDK {
     const buyer = validateAddress(params.buyer, "buyer");
     const sellerAddress = walletClient.account.address;
 
-    // Use default arbiter if none provided, reject zero address
-    let arbiter: Address;
-    if (params.arbiter) {
-      const validatedArbiter = validateAddress(params.arbiter, "arbiter");
-      if (isZeroAddress(validatedArbiter)) {
-        throw new SDKError(
-          "Zero address not allowed for arbiter. Omit arbiter param to use Palindrome Pay default.",
-          SDKErrorCode.VALIDATION_ERROR,
-        );
-      }
-      arbiter = validatedArbiter;
-    } else {
-      arbiter = await this.getDefaultArbiter();
-    }
+    // Use zero address if no arbiter provided (no dispute resolution)
+    const arbiter: Address = params.arbiter
+      ? validateAddress(params.arbiter, "arbiter")
+      : zeroAddress;
     const maturityDays = params.maturityTimeDays ?? 1n;
 
     // Validate using helper
@@ -1536,12 +1523,14 @@ export class PalindromePaySDK {
       title: params.title,
     });
 
-    // Validate arbiter is not buyer or seller
-    if (getAddress(arbiter) === getAddress(buyer)) {
-      throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
-    }
-    if (getAddress(arbiter) === getAddress(sellerAddress)) {
-      throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
+    // Validate arbiter is not buyer or seller (skip if zero address - no arbiter)
+    if (!isZeroAddress(arbiter)) {
+      if (getAddress(arbiter) === getAddress(buyer)) {
+        throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
+      }
+      if (getAddress(arbiter) === getAddress(sellerAddress)) {
+        throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
+      }
     }
 
     const ipfsHash = params.ipfsHash ?? "";
@@ -1669,20 +1658,10 @@ export class PalindromePaySDK {
     const seller = validateAddress(params.seller, "seller");
     const buyerAddress = walletClient.account.address;
 
-    // Use default arbiter if none provided, reject zero address
-    let arbiter: Address;
-    if (params.arbiter) {
-      const validatedArbiter = validateAddress(params.arbiter, "arbiter");
-      if (isZeroAddress(validatedArbiter)) {
-        throw new SDKError(
-          "Zero address not allowed for arbiter. Omit arbiter param to use Palindrome Pay default.",
-          SDKErrorCode.VALIDATION_ERROR,
-        );
-      }
-      arbiter = validatedArbiter;
-    } else {
-      arbiter = await this.getDefaultArbiter();
-    }
+    // Use zero address if no arbiter provided (no dispute resolution)
+    const arbiter: Address = params.arbiter
+      ? validateAddress(params.arbiter, "arbiter")
+      : zeroAddress;
     const maturityDays = params.maturityTimeDays ?? 1n;
 
     // Validate using helper
@@ -1696,12 +1675,14 @@ export class PalindromePaySDK {
       title: params.title,
     });
 
-    // Validate arbiter is not buyer or seller
-    if (getAddress(arbiter) === getAddress(seller)) {
-      throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
-    }
-    if (getAddress(arbiter) === getAddress(buyerAddress)) {
-      throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
+    // Validate arbiter is not buyer or seller (skip if zero address - no arbiter)
+    if (!isZeroAddress(arbiter)) {
+      if (getAddress(arbiter) === getAddress(seller)) {
+        throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
+      }
+      if (getAddress(arbiter) === getAddress(buyerAddress)) {
+        throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
+      }
     }
 
     const ipfsHash = params.ipfsHash ?? "";
@@ -3085,7 +3066,6 @@ export class PalindromePaySDK {
     this.escrowCache.clear();
     this.tokenDecimalsCache.clear();
     this.feeReceiverCache = null;
-    this.defaultArbiterCache = null;
     this.cachedFeeBps = null;
     this.multicallSupported = null;
     await this.clearApolloCache();
@@ -3839,38 +3819,6 @@ export class PalindromePaySDK {
     }) as Address;
 
     return this.feeReceiverCache;
-  }
-
-  /**
-   * Check if an escrow uses the default Palindrome Pay arbiter.
-   *
-   * @param escrow - The escrow data to check
-   * @returns True if the escrow uses the default arbiter
-   */
-  async isDefaultArbiter(escrow: EscrowData): Promise<boolean> {
-    const defaultArbiter = await this.getDefaultArbiter();
-    return escrow.arbiter.toLowerCase() === defaultArbiter.toLowerCase();
-  }
-
-  /**
-   * Get the default Palindrome Pay arbiter address from contract.
-   * Result is cached since the value is immutable.
-   *
-   * @returns The default arbiter address
-   */
-  async getDefaultArbiter(): Promise<Address> {
-    if (this.defaultArbiterCache) {
-      return this.defaultArbiterCache;
-    }
-
-    const arbiter = await readContract(this.publicClient, {
-      address: this.contractAddress,
-      abi: PalindromePayABI.abi as Abi,
-      functionName: "DEFAULT_ARBITER",
-    });
-
-    this.defaultArbiterCache = arbiter as Address;
-    return this.defaultArbiterCache;
   }
 
   /** Cached fee basis points (lazily computed from contract) */

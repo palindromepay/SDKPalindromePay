@@ -857,28 +857,31 @@ async function testEdge_EmptyTitle() {
 }
 
 async function testEdge_ZeroArbiter() {
-    section("EDGE: Zero arbiter rejected - must use default");
+    section("EDGE: Zero arbiter allowed (no dispute resolution)");
 
-    await fundAccount(buyerAccount.address);
+    await fundAccount(sellerAccount.address);
 
-    try {
-        await sdk.createEscrow(sellerWalletClient, {
-            token: USDT,
-            buyer: buyerAccount.address,
-            amount: AMOUNT,
-            maturityTimeDays: 1n,
-            arbiter: "0x0000000000000000000000000000000000000000" as Address,
-            title: "Zero Arbiter",
-            ipfsHash: "QmTest",
-        });
-        assert.fail("Should have rejected zero arbiter");
-    } catch (e: any) {
-        assert.equal(e.code, SDKErrorCode.VALIDATION_ERROR);
-        assert.ok(e.message.includes("Zero address not allowed"));
-        log("   ✅ Zero arbiter rejected with VALIDATION_ERROR");
-    }
+    // Create escrow with explicit zero arbiter
+    const { escrowId } = await sdk.createEscrow(sellerWalletClient, {
+        token: USDT,
+        buyer: buyerAccount.address,
+        amount: AMOUNT,
+        maturityTimeDays: 1n,
+        arbiter: "0x0000000000000000000000000000000000000000" as Address,
+        title: "Zero Arbiter",
+        ipfsHash: "QmTest",
+    });
 
-    pass("EDGE: Zero arbiter rejected");
+    // Verify the escrow was created with zero arbiter
+    const escrow = await sdk.getEscrowByIdParsed(escrowId);
+    assert.equal(
+        escrow.arbiter.toLowerCase(),
+        "0x0000000000000000000000000000000000000000",
+        "Arbiter should be zero address"
+    );
+    log("   ✅ Escrow created with zero arbiter");
+
+    pass("EDGE: Zero arbiter allowed");
 }
 
 async function testEdge_DuplicateEvidence() {
@@ -1110,7 +1113,7 @@ async function run() {
     console.log("");
     console.log("  EDGE CASE TESTS:");
     console.log("    ✅ Title length: max 100, reject 101, reject empty");
-    console.log("    ✅ Zero arbiter rejected (must use default)");
+    console.log("    ✅ Zero arbiter allowed (no dispute resolution)");
     console.log("    ✅ Duplicate evidence submission rejected");
     console.log("    ✅ Arbiter timeout decision (30 days)");
     console.log("");

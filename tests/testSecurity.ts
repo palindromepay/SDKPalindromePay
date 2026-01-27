@@ -687,27 +687,30 @@ async function testInput_ZeroAmountRejected() {
     pass("Input: Zero amount rejected");
 }
 
-async function testInput_ZeroArbiterRejectedAtCreation() {
-    section("Input: Zero arbiter rejected at creation");
+async function testInput_ZeroArbiterAllowed() {
+    section("Input: Zero arbiter allowed (no dispute resolution)");
 
     await fundAccount(sellerAccount.address);
 
     log("Creating with zero arbiter...");
-    try {
-        await sdk.createEscrow(sellerWalletClient, {
-            token: USDT,
-            buyer: buyerAccount.address,
-            amount: AMOUNT,
-            arbiter: "0x0000000000000000000000000000000000000000" as Address,
-            title: "Zero Arbiter Test",
-        });
-        assert.fail("Should have thrown VALIDATION_ERROR");
-    } catch (e: any) {
-        assert.equal(e.code, SDKErrorCode.VALIDATION_ERROR);
-        log("   ✅ Zero arbiter rejected at creation with VALIDATION_ERROR");
-    }
+    const { escrowId } = await sdk.createEscrow(sellerWalletClient, {
+        token: USDT,
+        buyer: buyerAccount.address,
+        amount: AMOUNT,
+        arbiter: "0x0000000000000000000000000000000000000000" as Address,
+        title: "Zero Arbiter Test",
+    });
 
-    pass("Input: Zero arbiter rejected at creation");
+    // Verify escrow was created with zero arbiter
+    const escrow = await sdk.getEscrowByIdParsed(escrowId);
+    assert.equal(
+        escrow.arbiter.toLowerCase(),
+        "0x0000000000000000000000000000000000000000",
+        "Arbiter should be zero address"
+    );
+    log("   ✅ Escrow created with zero arbiter");
+
+    pass("Input: Zero arbiter allowed");
 }
 
 async function testInput_SameBuyerSellerRejected() {
@@ -1032,7 +1035,7 @@ async function run() {
         testInput_TitleMaxLength,
         testInput_EmptyTitleRejected,
         testInput_ZeroAmountRejected,
-        testInput_ZeroArbiterRejectedAtCreation,
+        testInput_ZeroArbiterAllowed,
         testInput_SameBuyerSellerRejected,
 
         // Dispute Security (3 tests)
