@@ -29,6 +29,14 @@ A TypeScript/Node SDK for interacting with the PalindromePay escrow smart contra
 
 ---
 
+## 🚀 Getting Started
+
+Palindrome Pay is an open-source SDK for building escrow functionality into decentralized applications using smart contracts.
+
+**Non-custodial**: All funds are held in smart contracts on the blockchain - Palindrome Pay never has access to or control over user funds. Transactions are peer-to-peer between buyer and seller.
+
+---
+
 ## 📦 Installation
 
 ```bash
