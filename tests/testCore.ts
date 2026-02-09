@@ -25,6 +25,7 @@ import {
     SDKErrorCode,
     EscrowState,
 } from "../src/PalindromePaySDK";
+import { CONFIG } from "../src/config";
 
 // ════════════════════════════════════════════════════════════════════════════
 // ENV & CLIENTS
@@ -45,6 +46,9 @@ if (!sellerKey) throw new Error("SELLER_PRIVATE_KEY required");
 if (!arbiterKey) throw new Error("ARBITER_PRIVATE_KEY required");
 if (!deployerKey) throw new Error("DEPLOYER_PRIVATE_KEY required");
 if (!USDT) throw new Error("USDT required");
+
+// Override default contract address for local testing
+(CONFIG as any).DEFAULT_CONTRACT_ADDRESS = contractAddress;
 
 const chain = hardhat;
 
@@ -89,7 +93,6 @@ const apollo = new ApolloClient({
 
 const sdk = new PalindromePaySDK({
     publicClient,
-    contractAddress,
     walletClient: buyerWalletClient,
     apolloClient: apollo,
     chain,

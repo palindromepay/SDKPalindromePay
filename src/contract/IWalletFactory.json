@@ -1,0 +1,57 @@
+{
+  "_format": "hh3-artifact-1",
+  "contractName": "IWalletFactory",
+  "sourceName": "contracts/PalindromePay.sol",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "escrowId",
+          "type": "uint256"
+        }
+      ],
+      "name": "deploy",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "escrowContract",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "escrowId",
+          "type": "uint256"
+        }
+      ],
+      "name": "predictWalletAddress",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "bytecode": "0x",
+  "deployedBytecode": "0x",
+  "linkReferences": {},
+  "deployedLinkReferences": {},
+  "immutableReferences": {},
+  "inputSourceName": "project/contracts/PalindromePay.sol",
+  "buildInfoId": "solc-0_8_29-7d3d49b858752c29b6d8c98b0ba92bf7aed19fb0"
+}

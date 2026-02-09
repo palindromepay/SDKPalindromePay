@@ -246,8 +246,6 @@ export class SDKError extends Error {
 
 export interface PalindromePaySDKConfig {
   publicClient: PublicClient;
-  /** Contract address (defaults to Palindrome Pay on Base mainnet) */
-  contractAddress?: Address;
   walletClient?: EscrowWalletClient;
   /** Apollo client for subgraph queries (required) */
   apolloClient: ApolloClient;
@@ -474,8 +472,7 @@ export class PalindromePaySDK {
   ] as const;
 
   constructor(config: PalindromePaySDKConfig) {
-    // Use default contract address if none provided
-    this.contractAddress = config.contractAddress ?? CONFIG.DEFAULT_CONTRACT_ADDRESS;
+    this.contractAddress = CONFIG.DEFAULT_CONTRACT_ADDRESS;
     this.abiEscrow = PalindromePayABI.abi as Abi;
     this.abiWallet = PalindromePayWalletABI.abi as Abi;
     this.abiERC20 = ERC20ABI.abi as Abi;
@@ -868,6 +865,7 @@ export class PalindromePaySDK {
     WalletAuthorization: [
       { name: "escrowId", type: "uint256" },
       { name: "wallet", type: "address" },
+      { name: "escrowContract", type: "address" },
       { name: "participant", type: "address" },
     ],
   } as const;
@@ -919,6 +917,7 @@ export class PalindromePaySDK {
       message: {
         escrowId,
         wallet: walletAddress,
+        escrowContract: this.contractAddress,
         participant: walletClient.account.address,
       },
     });
@@ -946,6 +945,7 @@ export class PalindromePaySDK {
         message: {
           escrowId,
           wallet: walletAddress,
+          escrowContract: this.contractAddress,
           participant: expectedSigner,
         },
         signature,
@@ -1531,6 +1531,10 @@ export class PalindromePaySDK {
       if (getAddress(arbiter) === getAddress(sellerAddress)) {
         throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
       }
+      const feeReceiver = await this.getFeeReceiver();
+      if (getAddress(arbiter) === getAddress(feeReceiver)) {
+        throw new SDKError("Arbiter cannot be the fee receiver", SDKErrorCode.VALIDATION_ERROR);
+      }
     }
 
     const ipfsHash = params.ipfsHash ?? "";
@@ -1682,6 +1686,10 @@ export class PalindromePaySDK {
       }
       if (getAddress(arbiter) === getAddress(buyerAddress)) {
         throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
+      }
+      const feeReceiver = await this.getFeeReceiver();
+      if (getAddress(arbiter) === getAddress(feeReceiver)) {
+        throw new SDKError("Arbiter cannot be the fee receiver", SDKErrorCode.VALIDATION_ERROR);
       }
     }
 
@@ -3815,7 +3823,7 @@ export class PalindromePaySDK {
     this.feeReceiverCache = await this.publicClient.readContract({
       address: this.contractAddress,
       abi: this.abiEscrow,
-      functionName: "feeReceiver",
+      functionName: "FEE_RECEIVER",
     }) as Address;
 
     return this.feeReceiverCache;
