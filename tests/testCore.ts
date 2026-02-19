@@ -47,8 +47,8 @@ if (!arbiterKey) throw new Error("ARBITER_PRIVATE_KEY required");
 if (!deployerKey) throw new Error("DEPLOYER_PRIVATE_KEY required");
 if (!USDT) throw new Error("USDT required");
 
-// Override default contract address for local testing
-(CONFIG as any).DEFAULT_CONTRACT_ADDRESS = contractAddress;
+// Override contract address for local testing
+(CONFIG as any).CONTRACT_ADDRESS = contractAddress;
 
 const chain = hardhat;
 

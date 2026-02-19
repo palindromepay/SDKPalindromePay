@@ -250,6 +250,8 @@ export interface PalindromePaySDKConfig {
   /** Apollo client for subgraph queries (required) */
   apolloClient: ApolloClient;
   chain?: Chain;
+  /** Use Base Sepolia testnet contract (default: false = Base mainnet) */
+  testnet?: boolean;
   /** Cache TTL in milliseconds (default: 5000) */
   cacheTTL?: number;
   /** Maximum cache entries before LRU eviction (default: 1000) */
@@ -472,7 +474,9 @@ export class PalindromePaySDK {
   ] as const;
 
   constructor(config: PalindromePaySDKConfig) {
-    this.contractAddress = CONFIG.DEFAULT_CONTRACT_ADDRESS;
+    this.contractAddress = config.testnet
+      ? CONFIG.TESTNET_CONTRACT_ADDRESS
+      : CONFIG.CONTRACT_ADDRESS;
     this.abiEscrow = PalindromePayABI.abi as Abi;
     this.abiWallet = PalindromePayWalletABI.abi as Abi;
     this.abiERC20 = ERC20ABI.abi as Abi;
@@ -575,7 +579,7 @@ export class PalindromePaySDK {
    * Wait for transaction receipt with timeout and retry logic.
    */
   private async waitForReceipt(hash: Hex): Promise<TransactionReceipt> {
-    return this.withRetry(async () => {
+    const receipt = await this.withRetry(async () => {
       try {
         return await this.publicClient.waitForTransactionReceipt({
           hash,
@@ -593,6 +597,17 @@ export class PalindromePaySDK {
         throw error;
       }
     }, "waitForTransactionReceipt");
+
+    // Check receipt status (post-Byzantium: status 'reverted' means on-chain failure)
+    if (receipt.status === "reverted") {
+      throw new SDKError(
+        `Transaction reverted on-chain (hash: ${hash})`,
+        SDKErrorCode.TRANSACTION_FAILED,
+        { hash, blockNumber: receipt.blockNumber },
+      );
+    }
+
+    return receipt;
   }
 
   /**
@@ -787,11 +802,20 @@ export class PalindromePaySDK {
       return false;
     }
 
-    // Check for simulation-specific error patterns
+    // Contract reverts with a reason are real errors, NOT simulation failures.
+    // These should be thrown to the caller to avoid wasting gas.
+    if (
+      error.message?.includes("reverted with reason string") ||
+      error.message?.includes("reverted with custom error") ||
+      error.cause?.reason
+    ) {
+      return false;
+    }
+
+    // Only treat RPC-level simulation infrastructure failures as retriable
     return !!(
       error.message?.includes("simulation") ||
       error.message?.includes("eth_call") ||
-      error.message?.includes("execution reverted") ||
       error.cause?.message?.includes("simulation")
     );
   }
