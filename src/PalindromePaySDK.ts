@@ -579,24 +579,31 @@ export class PalindromePaySDK {
    * Wait for transaction receipt with timeout and retry logic.
    */
   private async waitForReceipt(hash: Hex): Promise<TransactionReceipt> {
-    const receipt = await this.withRetry(async () => {
-      try {
-        return await this.publicClient.waitForTransactionReceipt({
-          hash,
-          timeout: this.receiptTimeout,
-        });
-      } catch (error: unknown) {
-        const errorMessage = isViemError(error) ? error.message : String(error);
-        if (errorMessage.includes("timed out") || errorMessage.includes("timeout")) {
-          throw new SDKError(
-            `Transaction receipt timeout after ${this.receiptTimeout}ms`,
-            SDKErrorCode.TRANSACTION_FAILED,
-            { hash },
-          );
-        }
-        throw error;
+    // Retry the raw receipt wait so transient timeouts get another attempt.
+    // The timeout is only converted to a (non-retryable) SDKError after all
+    // attempts are exhausted — throwing the SDKError inside withRetry would
+    // short-circuit the retry loop (see withRetry's errorName === "SDKError" guard).
+    let receipt: TransactionReceipt;
+    try {
+      receipt = await this.withRetry(
+        () =>
+          this.publicClient.waitForTransactionReceipt({
+            hash,
+            timeout: this.receiptTimeout,
+          }),
+        "waitForTransactionReceipt",
+      );
+    } catch (error: unknown) {
+      const errorMessage = isViemError(error) ? error.message : String(error);
+      if (errorMessage.includes("timed out") || errorMessage.includes("timeout")) {
+        throw new SDKError(
+          `Transaction receipt timeout after ${this.receiptTimeout}ms`,
+          SDKErrorCode.TRANSACTION_FAILED,
+          { hash },
+        );
       }
-    }, "waitForTransactionReceipt");
+      throw error;
+    }
 
     // Check receipt status (post-Byzantium: status 'reverted' means on-chain failure)
     if (receipt.status === "reverted") {
@@ -651,6 +658,25 @@ export class PalindromePaySDK {
     throw lastError ?? new SDKError(
       `${operationName} failed after ${this.maxRetries} attempts`,
       SDKErrorCode.RPC_ERROR,
+    );
+  }
+
+  /**
+   * Execute a contract read with retry on transient RPC failures.
+   *
+   * Idempotent reads are safe to retry, so they honour the same
+   * enableRetry/maxRetries/retryDelay config as writes. On a persistent
+   * failure the original error is propagated unchanged (no API change).
+   */
+  private async read<T>(params: {
+    address: Address;
+    abi: Abi;
+    functionName: string;
+    args?: readonly unknown[];
+  }): Promise<T> {
+    return this.withRetry(
+      async () => (await readContract(this.publicClient, params as any)) as T,
+      `read:${params.functionName}`,
     );
   }
 
@@ -1077,13 +1103,12 @@ export class PalindromePaySDK {
    * Calls the contract's computeWalletAddress function - single source of truth
    */
   async predictWalletAddress(escrowId: bigint): Promise<Address> {
-    const predicted = await readContract(this.publicClient, {
+    return this.read<Address>({
       address: this.contractAddress,
       abi: PalindromePayABI.abi as Abi,
       functionName: "computeWalletAddress",
       args: [escrowId],
     });
-    return predicted as Address;
   }
 
   // ==========================================================================
@@ -1091,23 +1116,61 @@ export class PalindromePaySDK {
   // ==========================================================================
 
   /**
-   * Get raw escrow data from contract
+   * Build the LRU cache key for an escrow's raw on-chain data.
    */
-  async getEscrowById(escrowId: bigint): Promise<RawEscrowData> {
-    const raw = await readContract(this.publicClient, {
+  private escrowCacheKey(escrowId: bigint): string {
+    return `escrow-${escrowId}`;
+  }
+
+  /**
+   * Drop all cached data for an escrow. Called after any write that may
+   * change the escrow's on-chain state so subsequent reads from this SDK
+   * instance never observe stale data.
+   */
+  private invalidateEscrow(escrowId: bigint): void {
+    this.escrowCache.delete(this.escrowCacheKey(escrowId));
+    this.escrowCache.delete(`status-${escrowId}`);
+  }
+
+  /**
+   * Get raw escrow data from contract.
+   *
+   * Results are cached in the LRU cache for `cacheTTL` ms to de-duplicate
+   * rapid repeated reads (e.g. a UI rendering several components for the same
+   * escrow). Writes that mutate the escrow invalidate this entry, and callers
+   * that require strictly fresh data (all write pre-flight checks) pass
+   * `forceRefresh = true`.
+   *
+   * @param escrowId - The escrow ID
+   * @param forceRefresh - Bypass the cache and read fresh from chain
+   */
+  async getEscrowById(escrowId: bigint, forceRefresh = false): Promise<RawEscrowData> {
+    const cacheKey = this.escrowCacheKey(escrowId);
+
+    if (!forceRefresh) {
+      const cached = this.getCacheValue<RawEscrowData>(cacheKey);
+      if (cached) return cached;
+    }
+
+    const raw = await this.read<RawEscrowData>({
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "getEscrow",
       args: [escrowId],
     });
-    return raw as RawEscrowData;
+
+    this.setCacheValue(cacheKey, raw);
+    return raw;
   }
 
   /**
-   * Get parsed escrow data
+   * Get parsed escrow data.
+   *
+   * @param escrowId - The escrow ID
+   * @param forceRefresh - Bypass the cache and read fresh from chain
    */
-  async getEscrowByIdParsed(escrowId: bigint): Promise<EscrowData> {
-    const raw = await this.getEscrowById(escrowId);
+  async getEscrowByIdParsed(escrowId: bigint, forceRefresh = false): Promise<EscrowData> {
+    const raw = await this.getEscrowById(escrowId, forceRefresh);
     return {
       token: raw.token as Address,
       buyer: raw.buyer as Address,
@@ -1132,11 +1195,11 @@ export class PalindromePaySDK {
    * Get next escrow ID
    */
   async getNextEscrowId(): Promise<bigint> {
-    return readContract(this.publicClient, {
+    return this.read<bigint>({
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "nextEscrowId",
-    }) as Promise<bigint>;
+    });
   }
 
   // ==========================================================================
@@ -1154,12 +1217,12 @@ export class PalindromePaySDK {
    * @returns The bitmap as a bigint
    */
   async getNonceBitmap(escrowId: bigint, signer: Address, wordIndex: bigint = 0n): Promise<bigint> {
-    return this.publicClient.readContract({
+    return this.read<bigint>({
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "getNonceBitmap",
       args: [escrowId, signer, wordIndex],
-    }) as Promise<bigint>;
+    });
   }
 
   /**
@@ -1404,12 +1467,12 @@ export class PalindromePaySDK {
    * Get dispute submission status
    */
   async getDisputeSubmissionStatus(escrowId: bigint): Promise<DisputeSubmissionStatus> {
-    const status = await this.publicClient.readContract({
+    const status = await this.read<bigint>({
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "disputeStatus",
       args: [escrowId],
-    }) as bigint;
+    });
 
     const buyer = (status & 1n) !== 0n;
     const seller = (status & 2n) !== 0n;
@@ -1427,32 +1490,32 @@ export class PalindromePaySDK {
       return this.tokenDecimalsCache.get(tokenAddress)!;
     }
 
-    const decimals = await this.publicClient.readContract({
+    const decimals = await this.read<number>({
       address: tokenAddress,
       abi: this.abiERC20,
       functionName: "decimals",
-    }) as number;
+    });
 
     this.tokenDecimalsCache.set(tokenAddress, decimals);
     return decimals;
   }
 
   async getTokenBalance(account: Address, tokenAddress: Address): Promise<bigint> {
-    return this.publicClient.readContract({
+    return this.read<bigint>({
       address: tokenAddress,
       abi: this.abiERC20,
       functionName: "balanceOf",
       args: [account],
-    }) as Promise<bigint>;
+    });
   }
 
   async getTokenAllowance(owner: Address, spender: Address, tokenAddress: Address): Promise<bigint> {
-    return this.publicClient.readContract({
+    return this.read<bigint>({
       address: tokenAddress,
       abi: this.abiERC20,
       functionName: "allowance",
       args: [owner, spender],
-    }) as Promise<bigint>;
+    });
   }
 
   formatTokenAmount(amount: bigint, decimals: number): string {
@@ -1843,7 +1906,7 @@ export class PalindromePaySDK {
   ): Promise<{ txHash: Hex; signatureValid: boolean }> {
     assertWalletClient(walletClient);
 
-    const deal = await this.getEscrowByIdParsed(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
 
     // Verify caller and state using helpers
     this.verifyBuyer(walletClient.account.address, deal);
@@ -1888,6 +1951,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
 
     // Verify buyer signature is valid on-chain after deposit
     let buyerSigValid = false;
@@ -1943,7 +2007,7 @@ export class PalindromePaySDK {
   ): Promise<{ txHash: Hex; signatureValid: boolean }> {
     assertWalletClient(walletClient);
 
-    const deal = await this.getEscrowByIdParsed(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
 
     // Verify caller and state using helpers
     this.verifySeller(walletClient.account.address, deal);
@@ -1985,6 +2049,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
 
     // Verify seller signature is valid on-chain after accept
     let sellerSigValid = false;
@@ -2041,7 +2106,7 @@ export class PalindromePaySDK {
   ): Promise<Hex> {
     assertWalletClient(walletClient);
 
-    const deal = await this.getEscrowByIdParsed(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
 
     // Verify caller and state using helpers
     this.verifyBuyer(walletClient.account.address, deal);
@@ -2078,6 +2143,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2122,6 +2188,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2199,7 +2266,7 @@ export class PalindromePaySDK {
   ): Promise<Hex> {
     assertWalletClient(walletClient);
 
-    const deal = await this.getEscrowByIdParsed(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
     // Verify caller is buyer or seller
     const isBuyer = addressEquals(walletClient.account.address, deal.buyer);
     const isSeller = addressEquals(walletClient.account.address, deal.seller);
@@ -2246,6 +2313,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2274,7 +2342,7 @@ export class PalindromePaySDK {
   ): Promise<Hex> {
     assertWalletClient(walletClient);
 
-    const deal = await this.getEscrowByIdParsed(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
 
     // Verify caller using helper
     this.verifyBuyer(walletClient.account.address, deal);
@@ -2288,6 +2356,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2322,7 +2391,7 @@ export class PalindromePaySDK {
   ): Promise<Hex> {
     assertWalletClient(walletClient);
 
-    const deal = await this.getEscrowByIdParsed(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
 
     // Verify caller and state using helpers
     this.verifySeller(walletClient.account.address, deal);
@@ -2363,6 +2432,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2405,6 +2475,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2447,6 +2518,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2496,6 +2568,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2532,7 +2605,7 @@ export class PalindromePaySDK {
   ): Promise<Hex> {
     assertWalletClient(walletClient);
 
-    const deal = await this.getEscrowByIdParsed(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
 
     // Verify caller using helper
     this.verifyArbiter(walletClient.account.address, deal);
@@ -2568,6 +2641,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2601,7 +2675,7 @@ export class PalindromePaySDK {
   ): Promise<Hex> {
     assertWalletClient(walletClient);
 
-    const deal = await this.getEscrowByIdParsed(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
 
     // Verify final state
     if (![EscrowState.COMPLETE, EscrowState.REFUNDED, EscrowState.CANCELED].includes(deal.state)) {
@@ -2620,6 +2694,7 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
     return hash;
   }
 
@@ -2629,11 +2704,11 @@ export class PalindromePaySDK {
   async getWalletSignatureCount(escrowId: bigint): Promise<number> {
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    const count = await this.publicClient.readContract({
+    const count = await this.read<bigint>({
       address: deal.wallet,
       abi: this.abiWallet,
       functionName: "getValidSignatureCount",
-    }) as bigint;
+    });
 
     return Number(count);
   }
@@ -2644,11 +2719,11 @@ export class PalindromePaySDK {
   async getWalletBalance(escrowId: bigint): Promise<bigint> {
     const deal = await this.getEscrowByIdParsed(escrowId);
 
-    return this.publicClient.readContract({
+    return this.read<bigint>({
       address: deal.wallet,
       abi: this.abiWallet,
       functionName: "getBalance",
-    }) as Promise<bigint>;
+    });
   }
 
   // ==========================================================================
@@ -3844,11 +3919,11 @@ export class PalindromePaySDK {
       return this.feeReceiverCache;
     }
 
-    this.feeReceiverCache = await this.publicClient.readContract({
+    this.feeReceiverCache = await this.read<Address>({
       address: this.contractAddress,
       abi: this.abiEscrow,
       functionName: "FEE_RECEIVER",
-    }) as Address;
+    });
 
     return this.feeReceiverCache;
   }
