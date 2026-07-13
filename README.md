@@ -29,6 +29,42 @@ A TypeScript/Node SDK for interacting with the PalindromePay escrow smart contra
 
 ---
 
+## ⚠️ v3.0.0 — Outcome-Bound Payout Authorization (Multisig v2)
+
+SDK v3 targets the Multisig v2 contracts and is **not compatible with v1 deployments**.
+A participant's signature now authorizes one specific payout outcome instead of being a
+blanket participation token (`COMPLETE = 3`, `REFUNDED = 4`, `CANCELED = 5`):
+
+| Action | Signer | Outcome signed |
+|---|---|---|
+| `createEscrow` / `createEscrowAndDeposit` / `deposit` / `acceptEscrow` / `confirmDelivery` | seller / buyer | `COMPLETE` (3) |
+| `requestCancel` | buyer or seller | `CANCELED` (5) |
+| `submitArbiterDecision` | arbiter | the ruling: `COMPLETE` (3) or `REFUNDED` (4) |
+| `refundAfterDisputeTimeout` | buyer | `REFUNDED` (4) |
+| `autoRelease` / `cancelByTimeout` | — | reuses the stored signature |
+
+Breaking API changes:
+
+- `signWalletAuthorization(walletClient, wallet, escrowId, outcome)` signs the new
+  `PayoutAuthorization` EIP-712 type (extra `uint8 outcome` field).
+- `getWalletSignatureCount(escrowId, outcome)` counts signatures per outcome.
+- The escrow EIP-712 domain name changed to `"PalindromePay"`.
+- `CreateEscrowParams`/`CreateEscrowAndDepositParams` accept `arbiterFeeBps`
+  (0–2000 bps, paid only when the arbiter resolves a dispute).
+- `EscrowData` gained `maturityDuration` and `arbiterFeeBps`.
+
+New methods:
+
+- `refundAfterDisputeTimeout(walletClient, escrowId)` — buyer refund after the arbiter
+  missed the 30-day dispute deadline (+1h buffer).
+- `signSetArbiter(...)` + `setArbiterSigned(walletClient, params)` — assign an arbiter to an
+  arbiterless escrow with mutual buyer+seller consent (shared nonce, deadline ≤ 1 day).
+
+`deposit` now fails fast with "Escrow expired" when the maturity time has passed
+(the contract re-anchors the maturity window at deposit time).
+
+---
+
 ## 🚀 Getting Started
 
 Palindrome Pay is an open-source SDK for building escrow functionality into decentralized applications using smart contracts.

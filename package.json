@@ -1,7 +1,7 @@
 {
   "name": "@palindromepay/sdk",
-  "version": "2.1.7",
-  "description": "TypeScript SDK for PalindromeCryptoEscrow - Secure blockchain escrow with buyer/seller protection",
+  "version": "3.0.0",
+  "description": "TypeScript SDK for PalindromePay - Secure blockchain escrow with outcome-bound 2-of-3 multisig and buyer/seller protection",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -50,7 +50,7 @@
   "devDependencies": {
     "@apollo/client": "^4.0.7",
     "@types/jest": "^30.0.0",
-    "@types/node": "^24.7.0",
+    "@types/node": "^24.13.3",
     "@types/react": "^19.2.2",
     "jest": "^30.2.0",
     "ts-jest": "^29.4.4",

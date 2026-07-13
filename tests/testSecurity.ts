@@ -128,8 +128,8 @@ const ERC20_ABI = [
 const WALLET_ABI = [
     { name: "withdraw", type: "function", inputs: [], outputs: [], stateMutability: "nonpayable" },
     { name: "getBalance", type: "function", inputs: [], outputs: [{ type: "uint256" }], stateMutability: "view" },
-    { name: "getValidSignatureCount", type: "function", inputs: [], outputs: [{ type: "uint256" }], stateMutability: "view" },
-    { name: "isSignatureValid", type: "function", inputs: [{ name: "participant", type: "address" }], outputs: [{ type: "bool" }], stateMutability: "view" },
+    { name: "getValidSignatureCount", type: "function", inputs: [{ name: "outcome", type: "uint8" }], outputs: [{ type: "uint256" }], stateMutability: "view" },
+    { name: "isSignatureValid", type: "function", inputs: [{ name: "participant", type: "address" }, { name: "outcome", type: "uint8" }], outputs: [{ type: "bool" }], stateMutability: "view" },
     { name: "withdrawn", type: "function", inputs: [], outputs: [{ type: "bool" }], stateMutability: "view" },
 ] as const;
 

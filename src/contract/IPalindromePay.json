@@ -70,6 +70,11 @@
             },
             {
               "internalType": "uint256",
+              "name": "maturityDuration",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
               "name": "disputeStartTime",
               "type": "uint256"
             },
@@ -92,6 +97,11 @@
               "internalType": "uint8",
               "name": "tokenDecimals",
               "type": "uint8"
+            },
+            {
+              "internalType": "uint16",
+              "name": "arbiterFeeBps",
+              "type": "uint16"
             },
             {
               "internalType": "bytes",
@@ -124,5 +134,5 @@
   "deployedLinkReferences": {},
   "immutableReferences": {},
   "inputSourceName": "project/contracts/PalindromePayWallet.sol",
-  "buildInfoId": "solc-0_8_29-f4ec59cd75b01d9909fbcc64454fa277ca272075"
+  "buildInfoId": "solc-0_8_29-4ad6775f21944eaa3f183c1b3d683fef373f2334"
 }

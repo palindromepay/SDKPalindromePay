@@ -119,10 +119,10 @@ const ESCROW_ABI = [
 const WALLET_ABI = [
     { name: "withdraw", type: "function", inputs: [], outputs: [], stateMutability: "nonpayable" },
     { name: "getBalance", type: "function", inputs: [], outputs: [{ type: "uint256" }], stateMutability: "view" },
-    { name: "getValidSignatureCount", type: "function", inputs: [], outputs: [{ type: "uint256" }], stateMutability: "view" },
-    { name: "isSignatureValid", type: "function", inputs: [{ name: "participant", type: "address" }], outputs: [{ type: "bool" }], stateMutability: "view" },
+    { name: "getValidSignatureCount", type: "function", inputs: [{ name: "outcome", type: "uint8" }], outputs: [{ type: "uint256" }], stateMutability: "view" },
+    { name: "isSignatureValid", type: "function", inputs: [{ name: "participant", type: "address" }, { name: "outcome", type: "uint8" }], outputs: [{ type: "bool" }], stateMutability: "view" },
     { name: "withdrawn", type: "function", inputs: [], outputs: [{ type: "bool" }], stateMutability: "view" },
-    { name: "getAuthorizationDigest", type: "function", inputs: [{ name: "participant", type: "address" }], outputs: [{ type: "bytes32" }], stateMutability: "view" },
+    { name: "getAuthorizationDigest", type: "function", inputs: [{ name: "participant", type: "address" }, { name: "outcome", type: "uint8" }], outputs: [{ type: "bytes32" }], stateMutability: "view" },
     { name: "DOMAIN_SEPARATOR", type: "function", inputs: [], outputs: [{ type: "bytes32" }], stateMutability: "view" },
 ] as const;
 
@@ -169,22 +169,24 @@ async function getWalletBalance(walletAddress: Address): Promise<bigint> {
     }) as Promise<bigint>;
 }
 
-async function getValidSignatureCount(walletAddress: Address): Promise<number> {
+// Signatures are outcome-bound (Multisig v2): count/validity is per terminal state
+// (COMPLETE=3, REFUNDED=4, CANCELED=5). Default to the happy-path COMPLETE outcome.
+async function getValidSignatureCount(walletAddress: Address, outcome: number = Number(EscrowState.COMPLETE)): Promise<number> {
     const count = await publicClient.readContract({
         address: walletAddress,
         abi: WALLET_ABI,
         functionName: "getValidSignatureCount",
-        args: [],
+        args: [outcome],
     });
     return Number(count);
 }
 
-async function isSignatureValid(walletAddress: Address, participant: Address): Promise<boolean> {
+async function isSignatureValid(walletAddress: Address, participant: Address, outcome: number = Number(EscrowState.COMPLETE)): Promise<boolean> {
     return publicClient.readContract({
         address: walletAddress,
         abi: WALLET_ABI,
         functionName: "isSignatureValid",
-        args: [participant],
+        args: [participant, outcome],
     }) as Promise<boolean>;
 }
 
@@ -357,9 +359,11 @@ async function testScenario2_TimeoutRefund() {
     deal = await sdk.getEscrowByIdParsed(escrowId);
     assert.equal(deal.state, EscrowState.CANCELED, "Should be CANCELED");
 
-    const sigCount = await getValidSignatureCount(deal.wallet);
-    assert.ok(sigCount >= 2, `Need at least 2 signatures, got ${sigCount}`);
-    log(`   Valid signatures: ${sigCount}/3`);
+    // Unilateral timeout flow: only the buyer signed CANCELED (via requestCancel);
+    // withdrawal is authorized by the sole-beneficiary single-signature branch.
+    const sigCount = await getValidSignatureCount(deal.wallet, Number(EscrowState.CANCELED));
+    assert.ok(sigCount >= 1, `Need at least 1 CANCELED signature (sole beneficiary), got ${sigCount}`);
+    log(`   Valid CANCELED signatures: ${sigCount}/3`);
 
     log("Buyer withdrawing refund...");
     const buyerBefore = await getTokenBalance(buyerAccount.address);
@@ -399,7 +403,7 @@ async function testScenario3_MutualCancel() {
     deal = await sdk.getEscrowByIdParsed(escrowId);
     assert.equal(deal.state, EscrowState.CANCELED, "Should be CANCELED after mutual cancel");
 
-    const sigCount = await getValidSignatureCount(deal.wallet);
+    const sigCount = await getValidSignatureCount(deal.wallet, Number(EscrowState.CANCELED));
     assert.ok(sigCount >= 2, `Need at least 2 signatures, got ${sigCount}`);
     log(`   Valid signatures: ${sigCount}/3`);
 
@@ -452,9 +456,11 @@ async function testScenario4A_DisputeBuyerWins() {
     deal = await sdk.getEscrowByIdParsed(escrowId);
     assert.equal(deal.state, EscrowState.REFUNDED, "Should be REFUNDED");
 
-    const sigCount = await getValidSignatureCount(deal.wallet);
-    assert.ok(sigCount >= 2, `Need at least 2 signatures, got ${sigCount}`);
-    log(`   Valid signatures: ${sigCount}/3`);
+    // Only the arbiter signed REFUNDED; withdrawal is authorized by the
+    // arbiter single-signature (dispute tie-breaker) branch.
+    const sigCount = await getValidSignatureCount(deal.wallet, Number(EscrowState.REFUNDED));
+    assert.ok(sigCount >= 1, `Need at least 1 REFUNDED signature (arbiter), got ${sigCount}`);
+    log(`   Valid REFUNDED signatures: ${sigCount}/3`);
 
     log("Buyer withdrawing refund...");
     const buyerBefore = await getTokenBalance(buyerAccount.address);

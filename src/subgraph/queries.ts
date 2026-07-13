@@ -16,19 +16,24 @@ export const ALL_ESCROWS_QUERY = gql`
       wallet
       amount
       maturityTime
+      maturityDuration
       depositTime
       state
       title
       ipfsHash
       sellerWalletSig
+      sellerWalletSigOutcome
       buyerWalletSig
+      buyerWalletSigOutcome
       arbiterWalletSig
+      arbiterWalletSigOutcome
       sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
       fee
+      arbiterFeeBps
       disputeStartTime
       disputeLongDeadline
       disputeStatus
@@ -58,19 +63,24 @@ export const ESCROWS_BY_BUYER_QUERY = gql`
       wallet
       amount
       maturityTime
+      maturityDuration
       depositTime
       state
       title
       ipfsHash
       sellerWalletSig
+      sellerWalletSigOutcome
       buyerWalletSig
+      buyerWalletSigOutcome
       arbiterWalletSig
+      arbiterWalletSigOutcome
       sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
       fee
+      arbiterFeeBps
       disputeStartTime
       disputeLongDeadline
       disputeStatus
@@ -100,19 +110,24 @@ export const ESCROWS_BY_SELLER_QUERY = gql`
       wallet
       amount
       maturityTime
+      maturityDuration
       depositTime
       state
       title
       ipfsHash
       sellerWalletSig
+      sellerWalletSigOutcome
       buyerWalletSig
+      buyerWalletSigOutcome
       arbiterWalletSig
+      arbiterWalletSigOutcome
       sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
       fee
+      arbiterFeeBps
       disputeStartTime
       disputeLongDeadline
       disputeStatus
@@ -142,19 +157,24 @@ export const ESCROW_DETAIL_QUERY = gql`
       wallet
       amount
       maturityTime
+      maturityDuration
       depositTime
       state
       title
       ipfsHash
       sellerWalletSig
+      sellerWalletSigOutcome
       buyerWalletSig
+      buyerWalletSigOutcome
       arbiterWalletSig
+      arbiterWalletSigOutcome
       sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
       fee
+      arbiterFeeBps
       disputeStartTime
       disputeLongDeadline
       disputeStatus
@@ -221,12 +241,16 @@ export const ALL_DISPUTED_ESCROWS_QUERY = gql`
       title
       ipfsHash
       sellerWalletSig
+      sellerWalletSigOutcome
       buyerWalletSig
+      buyerWalletSigOutcome
       arbiterWalletSig
+      arbiterWalletSigOutcome
       sellerAccepted
       createdAt
       updatedAt
       fee
+      arbiterFeeBps
       disputeStartTime
       disputeLongDeadline
       disputeStatus
@@ -260,14 +284,18 @@ export const ESCROW_WITH_DISPUTE_DETAILS_QUERY = gql`
       title
       ipfsHash
       sellerWalletSig
+      sellerWalletSigOutcome
       buyerWalletSig
+      buyerWalletSigOutcome
       arbiterWalletSig
+      arbiterWalletSigOutcome
       sellerAccepted
       createdAt
       updatedAt
       buyerCancelRequested
       sellerCancelRequested
       fee
+      arbiterFeeBps
       disputeStartTime
       disputeLongDeadline
       disputeStatus
@@ -308,6 +336,7 @@ export const DISPUTED_ESCROWS_BY_BUYER_QUERY = gql`
       ipfsHash
       createdAt
       fee
+      arbiterFeeBps
       disputeStartTime
       disputeLongDeadline
       disputeStatus
@@ -337,6 +366,7 @@ export const DISPUTED_ESCROWS_BY_SELLER_QUERY = gql`
       ipfsHash
       createdAt
       fee
+      arbiterFeeBps
       disputeStartTime
       disputeLongDeadline
       disputeStatus
@@ -367,6 +397,7 @@ export const ESCROWS_PENDING_ARBITER_REVIEW_QUERY = gql`
       ipfsHash
       createdAt
       fee
+      arbiterFeeBps
       disputeStartTime
       disputeLongDeadline
       disputeStatus

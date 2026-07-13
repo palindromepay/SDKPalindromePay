@@ -162,6 +162,15 @@ export enum DisputeResolution {
   Refunded = 4,
 }
 
+/**
+ * Terminal escrow state a payout-authorization signature consents to (Multisig v2).
+ * COMPLETE releases to the seller, REFUNDED/CANCELED refund the buyer.
+ */
+export type PayoutOutcome =
+  | EscrowState.COMPLETE
+  | EscrowState.REFUNDED
+  | EscrowState.CANCELED;
+
 export enum Role {
   None = 0,
   Buyer = 1,
@@ -187,6 +196,18 @@ const MAX_MATURITY_DAYS = 3650n;
 
 /** Nonce bitmap word size in bits */
 const NONCE_BITMAP_SIZE = 256;
+
+/** Maximum arbiter fee in basis points (20%), mirrors the contract's MAX_ARBITER_FEE_BPS */
+export const MAX_ARBITER_FEE_BPS = 2000;
+
+/** Maximum setArbiterSigned deadline window (contract allows at most 1 day out) */
+const MAX_SET_ARBITER_DEADLINE_SECONDS = 86400n;
+
+/** Maximum time for the arbiter to resolve a dispute (mirrors contract DISPUTE_LONG_TIMEOUT) */
+const DISPUTE_LONG_TIMEOUT_SECONDS = 30n * 86400n;
+
+/** Buffer after dispute timeout before auto-resolution (mirrors contract TIMEOUT_BUFFER) */
+const TIMEOUT_BUFFER_SECONDS = 3600n;
 
 /** Default cache TTL in milliseconds */
 const DEFAULT_CACHE_TTL = 5000;
@@ -295,6 +316,8 @@ export interface CreateEscrowParams {
   amount: bigint;
   maturityTimeDays?: bigint;
   arbiter?: Address;
+  /** Arbiter fee in basis points (max 2000 = 20%); must be 0 without an arbiter. Default: 0 */
+  arbiterFeeBps?: number;
   title: string;
   ipfsHash?: string;
 }
@@ -305,8 +328,22 @@ export interface CreateEscrowAndDepositParams {
   amount: bigint;
   maturityTimeDays?: bigint;
   arbiter?: Address;
+  /** Arbiter fee in basis points (max 2000 = 20%); must be 0 without an arbiter. Default: 0 */
+  arbiterFeeBps?: number;
   title: string;
   ipfsHash?: string;
+}
+
+export interface SetArbiterSignedParams {
+  escrowId: bigint;
+  newArbiter: Address;
+  /** Arbiter fee in basis points (max 2000 = 20%) */
+  arbiterFeeBps: number;
+  buyerSig: Hex;
+  sellerSig: Hex;
+  deadline: bigint;
+  /** Shared nonce, consumed for BOTH signers */
+  nonce: bigint;
 }
 
 /** Raw escrow data from contract (before type narrowing to Address/Hex) */
@@ -319,11 +356,13 @@ export interface RawEscrowData {
   amount: bigint;
   depositTime: bigint;
   maturityTime: bigint;
+  maturityDuration: bigint;
   disputeStartTime: bigint;
   state: number;
   buyerCancelRequested: boolean;
   sellerCancelRequested: boolean;
   tokenDecimals: number;
+  arbiterFeeBps: number;
   sellerWalletSig: `0x${string}`;
   buyerWalletSig: `0x${string}`;
   arbiterWalletSig: `0x${string}`;
@@ -339,11 +378,13 @@ export interface EscrowData {
   amount: bigint;
   depositTime: bigint;
   maturityTime: bigint;
+  maturityDuration: bigint;
   disputeStartTime: bigint;
   state: EscrowState;
   buyerCancelRequested: boolean;
   sellerCancelRequested: boolean;
   tokenDecimals: number;
+  arbiterFeeBps: number;
   sellerWalletSig: Hex;
   buyerWalletSig: Hex;
   arbiterWalletSig: Hex;
@@ -704,11 +745,12 @@ export class PalindromePaySDK {
     buyerAddress: Address;
     sellerAddress: Address;
     arbiterAddress: Address;
+    arbiterFeeBps: number;
     amount: bigint;
     maturityDays: bigint;
     title: string;
   }): void {
-    const { tokenAddress, buyerAddress, sellerAddress, amount, maturityDays, title } = params;
+    const { tokenAddress, buyerAddress, sellerAddress, arbiterAddress, arbiterFeeBps, amount, maturityDays, title } = params;
 
     if (!tokenAddress || tokenAddress === zeroAddress) {
       throw new SDKError("Invalid token address", SDKErrorCode.VALIDATION_ERROR);
@@ -729,6 +771,18 @@ export class PalindromePaySDK {
     if (maturityDays > MAX_MATURITY_DAYS) {
       throw new SDKError(
         `Maturity days cannot exceed ${MAX_MATURITY_DAYS} days (10 years)`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+    if (!Number.isInteger(arbiterFeeBps) || arbiterFeeBps < 0 || arbiterFeeBps > MAX_ARBITER_FEE_BPS) {
+      throw new SDKError(
+        `Arbiter fee must be an integer between 0 and ${MAX_ARBITER_FEE_BPS} bps (20%)`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+    if (arbiterFeeBps > 0 && isZeroAddress(arbiterAddress)) {
+      throw new SDKError(
+        "Arbiter fee requires an arbiter",
         SDKErrorCode.VALIDATION_ERROR,
       );
     }
@@ -904,19 +958,30 @@ export class PalindromePaySDK {
    */
   private getEscrowDomain() {
     return {
-      name: "PalindromeCryptoEscrow",
+      name: "PalindromePay",
       version: "1",
       chainId: this.chain.id,
       verifyingContract: this.contractAddress,
     } as const;
   }
 
-  private readonly walletAuthorizationTypes = {
-    WalletAuthorization: [
+  private readonly payoutAuthorizationTypes = {
+    PayoutAuthorization: [
       { name: "escrowId", type: "uint256" },
       { name: "wallet", type: "address" },
       { name: "escrowContract", type: "address" },
       { name: "participant", type: "address" },
+      { name: "outcome", type: "uint8" },
+    ],
+  } as const;
+
+  private readonly setArbiterTypes = {
+    SetArbiter: [
+      { name: "escrowId", type: "uint256" },
+      { name: "newArbiter", type: "address" },
+      { name: "arbiterFeeBps", type: "uint16" },
+      { name: "deadline", type: "uint256" },
+      { name: "nonce", type: "uint256" },
     ],
   } as const;
 
@@ -949,26 +1014,30 @@ export class PalindromePaySDK {
   } as const;
 
   /**
-   * Sign a wallet authorization for a participant
-   * Used for: deposit, confirmDelivery, requestCancel, submitArbiterDecision
+   * Sign an outcome-bound payout authorization for a participant (Multisig v2).
+   * The signature consents to exactly one terminal escrow state:
+   * COMPLETE (deposit/create/accept/confirmDelivery), CANCELED (requestCancel),
+   * REFUNDED (refundAfterDisputeTimeout) or the arbiter's resolution.
    */
   async signWalletAuthorization(
     walletClient: EscrowWalletClient,
     walletAddress: Address,
     escrowId: bigint,
+    outcome: PayoutOutcome,
   ): Promise<Hex> {
     assertWalletClient(walletClient);
 
     const signature = await walletClient.signTypedData({
       account: walletClient.account,
       domain: this.getWalletDomain(walletAddress),
-      types: this.walletAuthorizationTypes,
-      primaryType: "WalletAuthorization",
+      types: this.payoutAuthorizationTypes,
+      primaryType: "PayoutAuthorization",
       message: {
         escrowId,
         wallet: walletAddress,
         escrowContract: this.contractAddress,
         participant: walletClient.account.address,
+        outcome,
       },
     });
 
@@ -977,26 +1046,28 @@ export class PalindromePaySDK {
   }
 
   /**
-   * Verify a wallet authorization signature locally before submitting transaction
-   * This ensures the signature is cryptographically valid for the expected signer
+   * Verify a payout authorization signature locally before submitting transaction
+   * This ensures the signature is cryptographically valid for the expected signer and outcome
    */
   private async verifyWalletSignature(
     signature: Hex,
     walletAddress: Address,
     escrowId: bigint,
     expectedSigner: Address,
+    outcome: PayoutOutcome,
   ): Promise<boolean> {
     try {
       return await verifyTypedData({
         address: expectedSigner,
         domain: this.getWalletDomain(walletAddress),
-        types: this.walletAuthorizationTypes,
-        primaryType: "WalletAuthorization",
+        types: this.payoutAuthorizationTypes,
+        primaryType: "PayoutAuthorization",
         message: {
           escrowId,
           wallet: walletAddress,
           escrowContract: this.contractAddress,
           participant: expectedSigner,
+          outcome,
         },
         signature,
       });
@@ -1075,6 +1146,41 @@ export class PalindromePaySDK {
     });
 
     validateSignature(signature as Hex, "start dispute signature");
+    return signature as Hex;
+  }
+
+  /**
+   * Sign a SetArbiter authorization (escrow domain).
+   *
+   * Buyer AND seller must each sign the SAME struct (same newArbiter, arbiterFeeBps,
+   * deadline and shared nonce); both signatures are then submitted together via
+   * `setArbiterSigned`. The arbiter itself does not sign.
+   */
+  async signSetArbiter(
+    walletClient: EscrowWalletClient,
+    escrowId: bigint,
+    newArbiter: Address,
+    arbiterFeeBps: number,
+    deadline: bigint,
+    nonce: bigint,
+  ): Promise<Hex> {
+    assertWalletClient(walletClient);
+
+    const signature = await walletClient.signTypedData({
+      account: walletClient.account,
+      domain: this.getEscrowDomain(),
+      types: this.setArbiterTypes,
+      primaryType: "SetArbiter",
+      message: {
+        escrowId,
+        newArbiter,
+        arbiterFeeBps,
+        deadline,
+        nonce,
+      },
+    });
+
+    validateSignature(signature as Hex, "set arbiter signature");
     return signature as Hex;
   }
 
@@ -1180,11 +1286,13 @@ export class PalindromePaySDK {
       amount: raw.amount as bigint,
       depositTime: raw.depositTime as bigint,
       maturityTime: raw.maturityTime as bigint,
+      maturityDuration: raw.maturityDuration as bigint,
       disputeStartTime: raw.disputeStartTime as bigint,
       state: Number(raw.state) as EscrowState,
       buyerCancelRequested: raw.buyerCancelRequested as boolean,
       sellerCancelRequested: raw.sellerCancelRequested as boolean,
       tokenDecimals: Number(raw.tokenDecimals),
+      arbiterFeeBps: Number(raw.arbiterFeeBps),
       sellerWalletSig: raw.sellerWalletSig as Hex,
       buyerWalletSig: raw.buyerWalletSig as Hex,
       arbiterWalletSig: raw.arbiterWalletSig as Hex,
@@ -1598,6 +1706,7 @@ export class PalindromePaySDK {
       ? validateAddress(params.arbiter, "arbiter")
       : zeroAddress;
     const maturityDays = params.maturityTimeDays ?? 1n;
+    const arbiterFeeBps = params.arbiterFeeBps ?? 0;
 
     // Validate using helper
     this.validateCreateEscrowParams({
@@ -1605,6 +1714,7 @@ export class PalindromePaySDK {
       buyerAddress: buyer,
       sellerAddress,
       arbiterAddress: arbiter,
+      arbiterFeeBps,
       amount: params.amount,
       maturityDays,
       title: params.title,
@@ -1630,11 +1740,12 @@ export class PalindromePaySDK {
     const nextId = await this.getNextEscrowId();
     const predictedWallet = await this.predictWalletAddress(nextId);
 
-    // Sign wallet authorization
+    // Sign wallet authorization: seller pre-authorizes the COMPLETE (happy-path) payout
     const sellerWalletSig = await this.signWalletAuthorization(
       walletClient,
       predictedWallet,
       nextId,
+      EscrowState.COMPLETE,
     );
 
     // Pre-validate signature before submitting transaction
@@ -1643,6 +1754,7 @@ export class PalindromePaySDK {
       predictedWallet,
       nextId,
       walletClient.account.address,
+      EscrowState.COMPLETE,
     );
 
     if (!isValidSig) {
@@ -1663,6 +1775,7 @@ export class PalindromePaySDK {
         params.amount,
         maturityDays,
         arbiter,
+        arbiterFeeBps,
         params.title,
         ipfsHash,
         sellerWalletSig,
@@ -1693,7 +1806,7 @@ export class PalindromePaySDK {
         address: deal.wallet,
         abi: this.abiWallet,
         functionName: "isSignatureValid",
-        args: [walletClient.account.address],
+        args: [walletClient.account.address, EscrowState.COMPLETE],
       }) as boolean;
     } catch (error) {
       verificationError = error instanceof Error ? error.message : String(error);
@@ -1754,6 +1867,7 @@ export class PalindromePaySDK {
       ? validateAddress(params.arbiter, "arbiter")
       : zeroAddress;
     const maturityDays = params.maturityTimeDays ?? 1n;
+    const arbiterFeeBps = params.arbiterFeeBps ?? 0;
 
     // Validate using helper
     this.validateCreateEscrowParams({
@@ -1761,6 +1875,7 @@ export class PalindromePaySDK {
       buyerAddress,
       sellerAddress: seller,
       arbiterAddress: arbiter,
+      arbiterFeeBps,
       amount: params.amount,
       maturityDays,
       title: params.title,
@@ -1794,11 +1909,12 @@ export class PalindromePaySDK {
     const nextId = await this.getNextEscrowId();
     const predictedWallet = await this.predictWalletAddress(nextId);
 
-    // Sign wallet authorization
+    // Sign wallet authorization: by funding, the buyer pre-authorizes the COMPLETE payout
     const buyerWalletSig = await this.signWalletAuthorization(
       walletClient,
       predictedWallet,
       nextId,
+      EscrowState.COMPLETE,
     );
 
     // Pre-validate signature before submitting transaction
@@ -1807,6 +1923,7 @@ export class PalindromePaySDK {
       predictedWallet,
       nextId,
       walletClient.account.address,
+      EscrowState.COMPLETE,
     );
 
     if (!isValidSig) {
@@ -1827,6 +1944,7 @@ export class PalindromePaySDK {
         params.amount,
         maturityDays,
         arbiter,
+        arbiterFeeBps,
         params.title,
         ipfsHash,
         buyerWalletSig,
@@ -1857,7 +1975,7 @@ export class PalindromePaySDK {
         address: deal.wallet,
         abi: this.abiWallet,
         functionName: "isSignatureValid",
-        args: [walletClient.account.address],
+        args: [walletClient.account.address, EscrowState.COMPLETE],
       }) as boolean;
     } catch (error) {
       verificationError = error instanceof Error ? error.message : String(error);
@@ -1912,6 +2030,17 @@ export class PalindromePaySDK {
     this.verifyBuyer(walletClient.account.address, deal);
     this.verifyState(deal, EscrowState.AWAITING_PAYMENT, "deposit");
 
+    // The contract rejects deposits into an already-expired escrow ("Escrow expired")
+    // and re-anchors the maturity window at deposit time. Fail fast client-side.
+    const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
+    if (deal.maturityTime > 0n && nowSeconds >= deal.maturityTime) {
+      throw new SDKError(
+        "Escrow expired - maturity time has passed, deposit is no longer possible",
+        SDKErrorCode.INVALID_STATE,
+        { escrowId: escrowId.toString(), maturityTime: deal.maturityTime.toString() },
+      );
+    }
+
     // Approve token spending
     await this.approveTokenIfNeeded(
       walletClient,
@@ -1920,11 +2049,12 @@ export class PalindromePaySDK {
       deal.amount,
     );
 
-    // Sign wallet authorization using the wallet address from the escrow
+    // Sign wallet authorization: depositing pre-authorizes the COMPLETE payout
     const buyerWalletSig = await this.signWalletAuthorization(
       walletClient,
       deal.wallet,
       escrowId,
+      EscrowState.COMPLETE,
     );
 
     // Pre-validate signature before submitting transaction
@@ -1933,6 +2063,7 @@ export class PalindromePaySDK {
       deal.wallet,
       escrowId,
       walletClient.account.address,
+      EscrowState.COMPLETE,
     );
 
     if (!isValidSig) {
@@ -1960,7 +2091,7 @@ export class PalindromePaySDK {
         address: deal.wallet,
         abi: this.abiWallet,
         functionName: "isSignatureValid",
-        args: [walletClient.account.address],
+        args: [walletClient.account.address, EscrowState.COMPLETE],
       }) as boolean;
     } catch (error) {
       this.log('warn', 'Failed to verify buyer signature after deposit', {
@@ -2018,11 +2149,12 @@ export class PalindromePaySDK {
       throw new SDKError("Escrow already accepted", SDKErrorCode.ALREADY_ACCEPTED);
     }
 
-    // Sign wallet authorization using the wallet address from the escrow
+    // Sign wallet authorization: accepting pre-authorizes the COMPLETE payout
     const sellerWalletSig = await this.signWalletAuthorization(
       walletClient,
       deal.wallet,
       escrowId,
+      EscrowState.COMPLETE,
     );
 
     // Pre-validate signature before submitting transaction
@@ -2031,6 +2163,7 @@ export class PalindromePaySDK {
       deal.wallet,
       escrowId,
       walletClient.account.address,
+      EscrowState.COMPLETE,
     );
 
     if (!isValidSig) {
@@ -2058,7 +2191,7 @@ export class PalindromePaySDK {
         address: deal.wallet,
         abi: this.abiWallet,
         functionName: "isSignatureValid",
-        args: [walletClient.account.address],
+        args: [walletClient.account.address, EscrowState.COMPLETE],
       }) as boolean;
     } catch (error) {
       this.log('warn', 'Failed to verify seller signature after accept', {
@@ -2112,11 +2245,12 @@ export class PalindromePaySDK {
     this.verifyBuyer(walletClient.account.address, deal);
     this.verifyState(deal, EscrowState.AWAITING_DELIVERY, "confirm delivery");
 
-    // Sign wallet authorization
+    // Sign wallet authorization: confirming delivery authorizes the COMPLETE payout
     const buyerWalletSig = await this.signWalletAuthorization(
       walletClient,
       deal.wallet,
       escrowId,
+      EscrowState.COMPLETE,
     );
 
     // Pre-validate signature before submitting transaction
@@ -2125,6 +2259,7 @@ export class PalindromePaySDK {
       deal.wallet,
       escrowId,
       walletClient.account.address,
+      EscrowState.COMPLETE,
     );
 
     if (!isValidSig) {
@@ -2229,10 +2364,10 @@ export class PalindromePaySDK {
       this.getUserNonce(escrowId, buyerWalletClient.account.address),
     ]);
 
-    // Sign coordinator message and wallet authorization in parallel
+    // Sign coordinator message and wallet authorization (COMPLETE payout) in parallel
     const [coordSignature, buyerWalletSig] = await Promise.all([
       this.signConfirmDelivery(buyerWalletClient, escrowId, deadline, nonce),
-      this.signWalletAuthorization(buyerWalletClient, deal.wallet, escrowId),
+      this.signWalletAuthorization(buyerWalletClient, deal.wallet, escrowId, EscrowState.COMPLETE),
     ]);
 
     return { coordSignature, buyerWalletSig, deadline, nonce };
@@ -2282,11 +2417,13 @@ export class PalindromePaySDK {
       );
     }
 
-    // Sign wallet authorization
+    // Sign wallet authorization: requesting cancel authorizes the CANCELED payout
+    // (overwrites the participant's stored signature with the new outcome on-chain)
     const walletSig = await this.signWalletAuthorization(
       walletClient,
       deal.wallet,
       escrowId,
+      EscrowState.CANCELED,
     );
 
     // Pre-validate signature before submitting transaction
@@ -2295,6 +2432,7 @@ export class PalindromePaySDK {
       deal.wallet,
       escrowId,
       walletClient.account.address,
+      EscrowState.CANCELED,
     );
 
     if (!isValidSig) {
@@ -2610,11 +2748,14 @@ export class PalindromePaySDK {
     // Verify caller using helper
     this.verifyArbiter(walletClient.account.address, deal);
 
-    // Sign wallet authorization
+    // Sign wallet authorization for the outcome being ruled (COMPLETE or REFUNDED)
+    const outcome: PayoutOutcome =
+      resolution === DisputeResolution.Complete ? EscrowState.COMPLETE : EscrowState.REFUNDED;
     const arbiterWalletSig = await this.signWalletAuthorization(
       walletClient,
       deal.wallet,
       escrowId,
+      outcome,
     );
 
     // Pre-validate signature before submitting transaction
@@ -2623,6 +2764,7 @@ export class PalindromePaySDK {
       deal.wallet,
       escrowId,
       walletClient.account.address,
+      outcome,
     );
 
     if (!isValidSig) {
@@ -2645,6 +2787,186 @@ export class PalindromePaySDK {
     return hash;
   }
 
+  /**
+   * Refund the buyer after the arbiter failed to resolve a dispute in time
+   *
+   * If a dispute has been open for longer than DISPUTE_LONG_TIMEOUT (30 days)
+   * plus TIMEOUT_BUFFER (1 hour), the buyer can unilaterally claim a full refund.
+   * The buyer signs a REFUNDED payout authorization; the single-signature
+   * withdrawal branch applies because the buyer is the sole beneficiary.
+   *
+   * @param walletClient - The buyer's wallet client (must have account connected)
+   * @param escrowId - The escrow ID to refund
+   * @returns Transaction hash
+   * @throws {SDKError} WALLET_NOT_CONNECTED - If wallet client is not connected
+   * @throws {SDKError} NOT_BUYER - If caller is not the designated buyer
+   * @throws {SDKError} INVALID_STATE - If escrow is not DISPUTED or the timeout has not elapsed
+   */
+  async refundAfterDisputeTimeout(
+    walletClient: EscrowWalletClient,
+    escrowId: bigint,
+  ): Promise<Hex> {
+    assertWalletClient(walletClient);
+
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
+
+    // Verify caller and state using helpers
+    this.verifyBuyer(walletClient.account.address, deal);
+    this.verifyState(deal, EscrowState.DISPUTED, "refund after dispute timeout");
+
+    const refundableAt = deal.disputeStartTime + DISPUTE_LONG_TIMEOUT_SECONDS + TIMEOUT_BUFFER_SECONDS;
+    const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
+    if (deal.disputeStartTime === 0n || nowSeconds < refundableAt) {
+      throw new SDKError(
+        `Dispute timeout has not elapsed yet - refund possible from ${refundableAt.toString()} (unix)`,
+        SDKErrorCode.INVALID_STATE,
+        { escrowId: escrowId.toString(), refundableAt: refundableAt.toString() },
+      );
+    }
+
+    // Sign wallet authorization: the buyer consents to the REFUNDED payout
+    const buyerWalletSig = await this.signWalletAuthorization(
+      walletClient,
+      deal.wallet,
+      escrowId,
+      EscrowState.REFUNDED,
+    );
+
+    // Pre-validate signature before submitting transaction
+    const isValidSig = await this.verifyWalletSignature(
+      buyerWalletSig,
+      deal.wallet,
+      escrowId,
+      walletClient.account.address,
+      EscrowState.REFUNDED,
+    );
+
+    if (!isValidSig) {
+      throw new SDKError(
+        "Buyer wallet signature is invalid - cannot refund after dispute timeout",
+        SDKErrorCode.SIGNATURE_INVALID,
+      );
+    }
+
+    // Refund
+    const hash = await this.resilientWriteContract(walletClient, {
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: "refundAfterDisputeTimeout",
+      args: [escrowId, buyerWalletSig],
+    });
+
+    await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
+    return hash;
+  }
+
+  // ==========================================================================
+  // LATE ARBITER ASSIGNMENT (MUTUAL CONSENT)
+  // ==========================================================================
+
+  /**
+   * Assign an arbiter to an arbiterless escrow via mutual consent
+   *
+   * Both buyer and seller must have signed the SAME SetArbiter struct
+   * (see `signSetArbiter`); anyone may then submit the transaction.
+   * Allowed only while no arbiter is set and the escrow is in
+   * AWAITING_PAYMENT or AWAITING_DELIVERY (set-once, no swap).
+   *
+   * The shared `nonce` is consumed for BOTH signers on-chain.
+   *
+   * @param walletClient - Any connected wallet client (typically buyer or seller)
+   * @param params - Escrow ID, new arbiter, fee, both signatures, deadline and shared nonce
+   * @returns Transaction hash
+   * @throws {SDKError} VALIDATION_ERROR - If arbiter/fee/deadline/nonce constraints are violated
+   * @throws {SDKError} INVALID_STATE - If an arbiter is already set or the state is terminal/disputed
+   */
+  async setArbiterSigned(
+    walletClient: EscrowWalletClient,
+    params: SetArbiterSignedParams,
+  ): Promise<Hex> {
+    assertWalletClient(walletClient);
+
+    const { escrowId, arbiterFeeBps, buyerSig, sellerSig, deadline, nonce } = params;
+    const newArbiter = validateAddress(params.newArbiter, "newArbiter");
+
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
+
+    if (!isZeroAddress(deal.arbiter)) {
+      throw new SDKError("Arbiter is already set", SDKErrorCode.INVALID_STATE);
+    }
+    if (![EscrowState.AWAITING_PAYMENT, EscrowState.AWAITING_DELIVERY].includes(deal.state)) {
+      throw new SDKError(
+        `Invalid state: ${this.STATE_NAMES[deal.state]}. Expected: AWAITING_PAYMENT or AWAITING_DELIVERY`,
+        SDKErrorCode.INVALID_STATE,
+      );
+    }
+
+    // Same arbiter rules as at creation
+    if (isZeroAddress(newArbiter)) {
+      throw new SDKError("Invalid arbiter address", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (addressEquals(newArbiter, deal.buyer)) {
+      throw new SDKError("Arbiter cannot be the buyer", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (addressEquals(newArbiter, deal.seller)) {
+      throw new SDKError("Arbiter cannot be the seller", SDKErrorCode.VALIDATION_ERROR);
+    }
+    const feeReceiver = await this.getFeeReceiver();
+    if (addressEquals(newArbiter, feeReceiver)) {
+      throw new SDKError("Arbiter cannot be the fee receiver", SDKErrorCode.VALIDATION_ERROR);
+    }
+    const arbiterCode = await this.publicClient.getCode({ address: newArbiter });
+    if (arbiterCode && arbiterCode !== "0x") {
+      throw new SDKError("Arbiter must be an EOA", SDKErrorCode.VALIDATION_ERROR);
+    }
+    if (!Number.isInteger(arbiterFeeBps) || arbiterFeeBps < 0 || arbiterFeeBps > MAX_ARBITER_FEE_BPS) {
+      throw new SDKError(
+        `Arbiter fee must be an integer between 0 and ${MAX_ARBITER_FEE_BPS} bps (20%)`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    // Deadline: must be in the future and at most 1 day out (contract rule)
+    const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
+    if (deadline <= nowSeconds) {
+      throw new SDKError("SetArbiter deadline has already passed", SDKErrorCode.SIGNATURE_EXPIRED);
+    }
+    if (deadline > nowSeconds + MAX_SET_ARBITER_DEADLINE_SECONDS) {
+      throw new SDKError(
+        "SetArbiter deadline must be at most 1 day in the future",
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    // The shared nonce is consumed for BOTH signers - it must be unused for each
+    const [buyerNonceUsed, sellerNonceUsed] = await Promise.all([
+      this.isNonceUsed(escrowId, deal.buyer, nonce),
+      this.isNonceUsed(escrowId, deal.seller, nonce),
+    ]);
+    if (buyerNonceUsed || sellerNonceUsed) {
+      throw new SDKError(
+        `Nonce ${nonce.toString()} already used for ${buyerNonceUsed ? "buyer" : "seller"}`,
+        SDKErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    validateSignature(buyerSig, "buyer set arbiter signature");
+    validateSignature(sellerSig, "seller set arbiter signature");
+
+    // Set arbiter
+    const hash = await this.resilientWriteContract(walletClient, {
+      address: this.contractAddress,
+      abi: this.abiEscrow,
+      functionName: "setArbiterSigned",
+      args: [escrowId, newArbiter, arbiterFeeBps, buyerSig, sellerSig, deadline, nonce],
+    });
+
+    await this.waitForReceipt(hash);
+    this.invalidateEscrow(escrowId);
+    return hash;
+  }
+
   // ==========================================================================
   // WALLET WITHDRAWAL
   // ==========================================================================
@@ -2653,15 +2975,18 @@ export class PalindromePaySDK {
    * Withdraw funds from the escrow wallet
    *
    * This function executes the actual token transfer from the escrow wallet to the
-   * designated recipient. The wallet contract uses a 2-of-3 multisig mechanism:
+   * designated recipient. The wallet authorizes against the terminal state's
+   * outcome (Multisig v2):
    *
-   * - COMPLETE state: Requires buyer + seller signatures → funds go to seller
-   * - REFUNDED state: Requires buyer + arbiter signatures → funds go to buyer
-   * - CANCELED state: Requires buyer + seller signatures → funds go to buyer
+   * - >= 2 of 3 participants signed that exact outcome (buyer+seller confirm,
+   *   mutual cancel, arbiter + benefiting party), or
+   * - exactly 1 valid signature where the signer is the arbiter (dispute
+   *   tie-breaker) or the sole beneficiary (autoRelease, cancelByTimeout,
+   *   refundAfterDisputeTimeout).
    *
-   * Anyone can call this function (typically the recipient), as the signatures
-   * were already collected during the escrow lifecycle. The wallet contract
-   * automatically reads and verifies signatures from the escrow contract.
+   * A COMPLETE signature does not satisfy a CANCELED/REFUNDED withdrawal and
+   * vice versa. Anyone can call this function (typically the recipient), as the
+   * signatures were already collected during the escrow lifecycle.
    *
    * @param walletClient - Any wallet client (typically the recipient)
    * @param escrowId - The escrow ID to withdraw from
@@ -2699,18 +3024,32 @@ export class PalindromePaySDK {
   }
 
   /**
-   * Get valid signature count for wallet
+   * Get how many of the 3 stored signatures authorize a specific payout outcome.
+   * Call with the escrow's terminal state to see the effective withdrawal quorum:
+   * >= 2 matching signatures, or exactly 1 from the arbiter / sole beneficiary.
    */
-  async getWalletSignatureCount(escrowId: bigint): Promise<number> {
+  async getWalletSignatureCount(escrowId: bigint, outcome: PayoutOutcome): Promise<number> {
     const deal = await this.getEscrowByIdParsed(escrowId);
 
     const count = await this.read<bigint>({
       address: deal.wallet,
       abi: this.abiWallet,
       functionName: "getValidSignatureCount",
+      args: [outcome],
     });
 
     return Number(count);
+  }
+
+  /**
+   * Map a terminal escrow state to its payout outcome (undefined for non-terminal states).
+   */
+  private terminalOutcomeOf(state: EscrowState): PayoutOutcome | undefined {
+    return state === EscrowState.COMPLETE ||
+      state === EscrowState.REFUNDED ||
+      state === EscrowState.CANCELED
+      ? state
+      : undefined;
   }
 
   /**
@@ -2993,7 +3332,10 @@ export class PalindromePaySDK {
     assertWalletClient(walletClient);
 
     const deal = await this.getEscrowByIdParsed(escrowId);
-    const signatureCount = await this.getWalletSignatureCount(escrowId);
+    // Withdrawal authorizes against the terminal state's outcome; before a
+    // terminal state is reached, report the happy-path (COMPLETE) quorum.
+    const outcome = this.terminalOutcomeOf(deal.state) ?? EscrowState.COMPLETE;
+    const signatureCount = await this.getWalletSignatureCount(escrowId, outcome);
 
     try {
       const gasEstimate = await this.publicClient.estimateContractGas({
@@ -3720,6 +4062,7 @@ export class PalindromePaySDK {
     amount: bigint;
     maturityDays: bigint;
     arbiter: Address;
+    arbiterFeeBps?: number;
     title: string;
     ipfsHash: string;
   }): Promise<{
@@ -3742,6 +4085,7 @@ export class PalindromePaySDK {
           params.amount,
           params.maturityDays,
           params.arbiter,
+          params.arbiterFeeBps ?? 0,
           params.title,
           params.ipfsHash,
           pad('0x00', { size: 65 }) // Empty seller wallet sig
