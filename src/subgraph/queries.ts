@@ -187,16 +187,6 @@ export const ESCROW_DETAIL_QUERY = gql`
         timestamp
         txHash
       }
-      events {
-        id
-        type
-        sender
-        amount
-        fee
-        state
-        timestamp
-        details
-      }
     }
   }
 `;
@@ -307,16 +297,6 @@ export const ESCROW_WITH_DISPUTE_DETAILS_QUERY = gql`
         ipfsHash
         timestamp
         txHash
-      }
-      events(orderBy: timestamp, orderDirection: desc) {
-        id
-        type
-        sender
-        amount
-        fee
-        state
-        timestamp
-        details
       }
     }
   }
@@ -487,7 +467,9 @@ export const DISPUTE_SUBMISSION_STATUS_QUERY = gql`
   }
 `;
 
-// Get all events for a disputed escrow
+// Dispute status snapshot for a disputed escrow.
+// NOTE: the v2 subgraph schema no longer has an `events` entity on Escrow —
+// per-event history was dropped in the Multisig v2 migration.
 export const DISPUTED_ESCROW_EVENTS_QUERY = gql`
   query DisputedEscrowEvents($escrowId: ID!) {
     escrow(id: $escrowId) {
@@ -496,16 +478,6 @@ export const DISPUTED_ESCROW_EVENTS_QUERY = gql`
       disputeStatus
       disputeStartTime
       disputeLongDeadline
-      events(orderBy: timestamp, orderDirection: asc) {
-        id
-        type
-        sender
-        amount
-        fee
-        state
-        timestamp
-        details
-      }
     }
   }
 `;

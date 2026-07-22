@@ -9,6 +9,7 @@
     "test": "ts-node tests/testCore.ts && ts-node tests/testSecurity.ts",
     "test:core": "ts-node tests/testCore.ts",
     "test:security": "ts-node tests/testSecurity.ts",
+    "test:subgraph": "ts-node tests/testSubgraph.ts",
     "prepublishOnly": "npm test && npm run build",
     "publish:skip-tests": "npm run build && npm publish --access public --ignore-scripts",
     "version": "npm run build",
