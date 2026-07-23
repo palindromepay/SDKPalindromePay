@@ -41,7 +41,7 @@ const runLive = process.env.RUN_LIVE === "1";
 // Deliberately NOT process.env.USDT — that one points at the local hardhat token
 const USDT = process.env.SEPOLIA_USDT as Address | undefined;
 
-const DEPLOY_START_BLOCK = 44472870n;
+const DEPLOY_START_BLOCK = 44520891n; // v2 deployment with EIP-7702 arbiter support
 
 const chain = baseSepolia;
 const publicClient = createPublicClient({ chain, transport: http(rpcUrl) }) as PublicClient;
@@ -117,15 +117,25 @@ async function testEndpointHealth() {
 // PART 2: SDK QUERIES + ON-CHAIN CROSS-CHECK (gas-free)
 // ════════════════════════════════════════════════════════════════════════════
 
-async function testSdkQueriesAgainstChain() {
-    section("SDK QUERIES vs ON-CHAIN (escrow #0)");
+async function testSdkQueriesAgainstChain(): Promise<boolean> {
+    section("SDK QUERIES vs ON-CHAIN (latest escrow)");
+
+    // Fresh deployments have no escrows yet — nothing to compare. The live
+    // ingestion test (RUN_LIVE=1) creates the first one; rerun afterwards.
+    const nextId = await sdk.getNextEscrowId();
+    if (nextId === 0n) {
+        log("No escrow exists on-chain yet (nextEscrowId=0) — comparison deferred.");
+        console.log("  ⏭️  SDK-query cross-check skipped (empty contract; run RUN_LIVE=1 first)\n");
+        return false;
+    }
+    const escrowId = nextId - 1n; // latest existing escrow
 
     // Exercises ESCROW_DETAIL_QUERY incl. every v2 field — any schema/query
     // name drift makes this throw a GraphQL validation error.
-    const indexed = await sdk.getEscrowDetail("0");
-    assert.ok(indexed, "escrow #0 must be indexed");
+    const indexed = await sdk.getEscrowDetail(escrowId);
+    assert.ok(indexed, `escrow #${escrowId} must be indexed`);
 
-    const onChain = await sdk.getEscrowByIdParsed(0n, true);
+    const onChain = await sdk.getEscrowByIdParsed(escrowId, true);
 
     assert.equal(indexed!.amount, onChain.amount.toString(), "amount mismatch");
     assert.equal(indexed!.buyer.toLowerCase(), onChain.buyer.toLowerCase(), "buyer mismatch");
@@ -135,20 +145,36 @@ async function testSdkQueriesAgainstChain() {
     assert.equal(indexed!.state, STATE_NAMES[onChain.state], "state mismatch");
     log(`Core fields match on-chain (state ${indexed!.state}, amount ${indexed!.amount})`);
 
-    // The new v2 fields — the whole point of the migration
+    // The new v2 fields — the whole point of the migration. Outcomes are only
+    // set once the matching signature exists on-chain, so assert presence-
+    // consistency instead of hard-coded values (works for any escrow state).
     assert.equal(indexed!.arbiterFeeBps, onChain.arbiterFeeBps, "arbiterFeeBps mismatch");
     assert.equal(indexed!.maturityDuration, onChain.maturityDuration.toString(), "maturityDuration mismatch");
-    assert.equal(indexed!.sellerWalletSigOutcome, EscrowState.COMPLETE, "seller sig must be outcome-bound to COMPLETE");
-    assert.equal(indexed!.buyerWalletSigOutcome ?? null, null, "buyer outcome must be unset before deposit");
-    assert.equal(indexed!.arbiterWalletSigOutcome ?? null, null, "arbiter outcome must be unset");
-    log(`v2 fields match: arbiterFeeBps=${indexed!.arbiterFeeBps}, maturityDuration=${indexed!.maturityDuration}, sellerSigOutcome=${indexed!.sellerWalletSigOutcome}`);
+    const outcomePairs: Array<[string, `0x${string}`, number | null | undefined]> = [
+        ["seller", onChain.sellerWalletSig, indexed!.sellerWalletSigOutcome],
+        ["buyer", onChain.buyerWalletSig, indexed!.buyerWalletSigOutcome],
+        ["arbiter", onChain.arbiterWalletSig, indexed!.arbiterWalletSigOutcome],
+    ];
+    for (const [who, sig, outcome] of outcomePairs) {
+        const hasSig = !!sig && sig !== "0x";
+        if (hasSig) {
+            assert.ok(
+                outcome === EscrowState.COMPLETE || outcome === EscrowState.REFUNDED || outcome === EscrowState.CANCELED,
+                `${who} sig exists on-chain but indexed outcome is ${outcome}`,
+            );
+        } else {
+            assert.equal(outcome ?? null, null, `${who} has no sig on-chain but indexed outcome is ${outcome}`);
+        }
+    }
+    log(`v2 fields match: arbiterFeeBps=${indexed!.arbiterFeeBps}, maturityDuration=${indexed!.maturityDuration}, outcomes=[${outcomePairs.map(([w, , o]) => `${w}:${o ?? "-"}`).join(", ")}]`);
 
     // List query must include the indexed escrow
     const all = await sdk.getEscrows();
-    assert.ok(all.some((e) => e.id === "0"), "getEscrows() must contain escrow #0");
+    assert.ok(all.some((e) => e.id === escrowId.toString()), `getEscrows() must contain escrow #${escrowId}`);
     log(`getEscrows(): ${all.length} escrow(s) listed`);
 
     pass("SDK subgraph queries consistent with on-chain state");
+    return true;
 }
 
 // ════════════════════════════════════════════════════════════════════════════

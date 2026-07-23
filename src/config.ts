@@ -9,6 +9,6 @@ export const CONFIG = {
   // compatible with the v1 contracts.
   /** PalindromePay contract address (Base mainnet) */
   CONTRACT_ADDRESS: "0x47631c5Efe9AA709A020638B51E05b07e32FAF43" as Address,
-  /** PalindromePay v2 contract address (Base Sepolia testnet, deployed at block 44472870) */
-  TESTNET_CONTRACT_ADDRESS: "0x284f3cfecf64efb47a13bf7daca1aadea646f885" as Address,
+  /** PalindromePay v2 contract address (Base Sepolia testnet, block 44533995, EIP-7702 arbiters allowed) */
+  TESTNET_CONTRACT_ADDRESS: "0x84786faacb03eb2972c691af6c7ec78d0d75b439" as Address,
 } as const;

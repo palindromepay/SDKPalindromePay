@@ -144,7 +144,7 @@ export const ESCROWS_BY_SELLER_QUERY = gql`
   }
 `;
 
-// Detail for one escrow (with full dispute info and events)
+// Detail for one escrow (with full dispute info)
 export const ESCROW_DETAIL_QUERY = gql`
   query EscrowDetail($id: ID!) {
     escrow(id: $id) {

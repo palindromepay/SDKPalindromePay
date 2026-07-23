@@ -1,6 +1,6 @@
 {
   "name": "@palindromepay/sdk",
-  "version": "3.0.0",
+  "version": "3.0.3",
   "description": "TypeScript SDK for PalindromePay - Secure blockchain escrow with outcome-bound 2-of-3 multisig and buyer/seller protection",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,6 +10,7 @@
     "test:core": "ts-node tests/testCore.ts",
     "test:security": "ts-node tests/testSecurity.ts",
     "test:subgraph": "ts-node tests/testSubgraph.ts",
+    "test:preflight": "ts-node tests/testWritePreflight.ts",
     "prepublishOnly": "npm test && npm run build",
     "publish:skip-tests": "npm run build && npm publish --access public --ignore-scripts",
     "version": "npm run build",

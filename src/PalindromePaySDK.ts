@@ -573,7 +573,7 @@ export class PalindromePaySDK {
    * @param params.args - Function arguments
    * @returns Transaction hash
    */
-  private async resilientWriteContract(
+  protected async resilientWriteContract(
     walletClient: EscrowWalletClient,
     params: {
       address: Address;
@@ -588,6 +588,36 @@ export class PalindromePaySDK {
     if (this.skipSimulation) {
       this.log('debug', `Skipping simulation for ${functionName}, sending directly`);
       return this.sendTransactionDirect(walletClient, params);
+    }
+
+    // Path 1.5: Preflight-simulate via the public client to surface a decoded revert
+    // BEFORE the wallet estimates gas. Injected wallets (MetaMask) otherwise swallow
+    // the revert into an oversized gas fallback that Base rejects as "exceeds max
+    // transaction gas limit", hiding the real reason. A genuine revert here is thrown
+    // as a clean SDKError (no wallet popup, no wasted gas); RPC/infra flakiness is
+    // tolerated (that is what the direct-send fallback exists for).
+    try {
+      await this.publicClient.simulateContract({
+        address,
+        abi,
+        functionName,
+        args,
+        account: walletClient.account,
+        chain: this.chain,
+      });
+    } catch (simError: unknown) {
+      const revert = this.extractRevertReason(simError);
+      if (revert) {
+        throw new SDKError(
+          `Transaction would revert: ${revert.reason}`,
+          SDKErrorCode.TRANSACTION_FAILED,
+          { functionName, errorName: revert.errorName, revertReason: revert.reason },
+        );
+      }
+      this.log('warn', `Preflight simulation inconclusive for ${functionName}, proceeding anyway`, {
+        error: isViemError(simError) ? simError.message?.slice(0, 120) : String(simError),
+        functionName,
+      });
     }
 
     // Path 2: Try normal write with simulation
@@ -635,8 +665,20 @@ export class PalindromePaySDK {
         "waitForTransactionReceipt",
       );
     } catch (error: unknown) {
+      // Detect timeouts by viem error NAME (message wording is version-dependent
+      // and case-sensitive matching missed viem's "Timed out while waiting…").
+      let isTimeout = false;
+      let cur: unknown = error;
+      for (let i = 0; i < 8 && cur; i++) {
+        const name = (cur as { name?: string }).name;
+        if (name === "WaitForTransactionReceiptTimeoutError" || name === "TimeoutError") {
+          isTimeout = true;
+          break;
+        }
+        cur = (cur as { cause?: unknown }).cause;
+      }
       const errorMessage = isViemError(error) ? error.message : String(error);
-      if (errorMessage.includes("timed out") || errorMessage.includes("timeout")) {
+      if (isTimeout || /timed out|timeout/i.test(errorMessage)) {
         throw new SDKError(
           `Transaction receipt timeout after ${this.receiptTimeout}ms`,
           SDKErrorCode.TRANSACTION_FAILED,
@@ -656,6 +698,37 @@ export class PalindromePaySDK {
     }
 
     return receipt;
+  }
+
+  /**
+   * Wait for a write's receipt and invalidate the escrow's cache entries.
+   * Invalidation runs in `finally`: even on a receipt timeout the transaction
+   * may still land later, so cached pre-write state must not survive.
+   */
+  private async confirmWrite(hash: Hex, escrowId: bigint): Promise<TransactionReceipt> {
+    try {
+      return await this.waitForReceipt(hash);
+    } finally {
+      this.invalidateEscrow(escrowId);
+    }
+  }
+
+  /**
+   * Wait until a freshly created escrow is readable. On load-balanced RPC
+   * endpoints the receipt can come from a node ahead of the read nodes, so an
+   * immediate getEscrow would revert "Escrow does not exist" (and deterministic
+   * reverts are intentionally not retried by withRetry).
+   */
+  private async waitForEscrowVisible(escrowId: bigint): Promise<void> {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const nextId = await this.getNextEscrowId();
+      if (nextId > escrowId) return;
+      this.log('debug', 'Created escrow not yet visible on read node, waiting', {
+        escrowId: escrowId.toString(), attempt,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    this.log('warn', 'Created escrow still not visible after 10s', { escrowId: escrowId.toString() });
   }
 
   /**
@@ -682,6 +755,13 @@ export class PalindromePaySDK {
           errorCode === USER_REJECTION_CODE || // User rejected
           errorName === "SDKError"
         ) {
+          throw error;
+        }
+
+        // Deterministic contract reverts can never succeed on retry — fail fast
+        // instead of burning maxRetries × backoff on them. Errors without a
+        // decodable revert (RPC/infra flakiness) keep the retry behaviour.
+        if (this.extractRevertReason(error) !== null) {
           throw error;
         }
 
@@ -898,6 +978,93 @@ export class PalindromePaySDK {
       error.message?.includes("eth_call") ||
       error.cause?.message?.includes("simulation")
     );
+  }
+
+  /**
+   * Decode a genuine contract revert out of a viem error.
+   *
+   * Returns the human reason (and custom-error name, if any) when the error is a
+   * real on-chain revert, or `null` for infrastructure/RPC failures. Used both by
+   * the write preflight and the public simulate helpers so revert extraction lives
+   * in one place.
+   */
+  private extractRevertReason(error: unknown): { reason: string; errorName?: string } | null {
+    if (!isViemError(error)) return null;
+
+    // Walk the cause chain for viem's ContractFunctionRevertedError (carries the
+    // decoded custom-error name via .data.errorName).
+    let cur: unknown = error;
+    for (let i = 0; i < 8 && cur; i++) {
+      const node = cur as { name?: string; data?: { errorName?: string }; reason?: string; shortMessage?: string; message?: string; cause?: unknown };
+      if (node.name === "ContractFunctionRevertedError") {
+        const errorName = node.data?.errorName;
+        const reason = node.reason ?? errorName ?? node.shortMessage ?? node.message ?? "reverted";
+        return { reason: String(reason), errorName };
+      }
+      cur = node.cause;
+    }
+
+    const anyErr = error as { cause?: { reason?: string }; message?: string };
+    if (anyErr.cause?.reason) return { reason: String(anyErr.cause.reason) };
+    const reasonMatch = anyErr.message?.match(/reverted with reason string ['"]([^'"]+)['"]/);
+    if (reasonMatch) return { reason: reasonMatch[1] };
+    const followMatch = anyErr.message?.match(/reverted with the following reason:\s*\n?\s*([^\n]+)/);
+    if (followMatch) return { reason: followMatch[1].trim() };
+    return null;
+  }
+
+  /**
+   * Assert that an arbiter address is EOA-like, mirroring the contract's
+   * `_isEoaLike` rule: plain EOAs and EIP-7702 delegated EOAs (e.g. MetaMask
+   * Smart Accounts, code = 0xef0100 ++ 20-byte delegate, exactly 23 bytes) are
+   * accepted; deployed contracts are rejected. Deployed bytecode can never start
+   * with 0xEF (EIP-3541), so the prefix check cannot be spoofed. 7702 accounts
+   * keep their private key, so ECDSA arbiter signatures keep working.
+   */
+  private async assertArbiterIsEoa(arbiter: Address): Promise<void> {
+    const code = await this.publicClient.getCode({ address: arbiter });
+    if (!code || code === "0x") return;
+    // 23 bytes = "0x" + 46 hex chars
+    if (code.length === 48 && code.toLowerCase().startsWith("0xef0100")) return;
+    throw new SDKError(
+      "Arbiter must be an EOA - this address is a deployed contract. " +
+      "Use a regular wallet address (EIP-7702 smart accounts are fine).",
+      SDKErrorCode.VALIDATION_ERROR,
+    );
+  }
+
+  /**
+   * True when an error is the outcome-bound-signature mismatch the contract raises
+   * when a create signature was bound to a stale escrow id (id drift). Used by the
+   * create flows to self-heal by re-reading nextEscrowId and re-signing once.
+   */
+  private isIdDriftRevert(error: unknown): boolean {
+    return (
+      error instanceof SDKError &&
+      (error.details as { errorName?: string } | undefined)?.errorName === "InvalidWalletSignature"
+    );
+  }
+
+  /**
+   * Sign the seller/buyer wallet authorization for a create call (COMPLETE outcome).
+   * Extracted as a seam so tests can force id drift; production behaviour is a plain
+   * `signWalletAuthorization`.
+   */
+  protected async signCreateAuthorization(
+    walletClient: EscrowWalletClient,
+    predictedWallet: Address,
+    escrowId: bigint,
+  ): Promise<Hex> {
+    return this.signWalletAuthorization(walletClient, predictedWallet, escrowId, EscrowState.COMPLETE);
+  }
+
+  /**
+   * Test seam invoked after signing a create authorization but before submitting.
+   * No-op in production; tests override it to advance on-chain nextEscrowId and
+   * exercise the id-drift self-heal path.
+   */
+  protected async afterCreateSignHook(): Promise<void> {
+    /* intentional no-op */
   }
 
   /**
@@ -1229,13 +1396,20 @@ export class PalindromePaySDK {
   }
 
   /**
+   * Build the LRU cache key for an escrow's derived status entry.
+   */
+  private statusCacheKey(escrowId: bigint): string {
+    return `status-${escrowId}`;
+  }
+
+  /**
    * Drop all cached data for an escrow. Called after any write that may
    * change the escrow's on-chain state so subsequent reads from this SDK
    * instance never observe stale data.
    */
   private invalidateEscrow(escrowId: bigint): void {
     this.escrowCache.delete(this.escrowCacheKey(escrowId));
-    this.escrowCache.delete(`status-${escrowId}`);
+    this.escrowCache.delete(this.statusCacheKey(escrowId));
   }
 
   /**
@@ -1660,6 +1834,22 @@ export class PalindromePaySDK {
     });
 
     await this.waitForReceipt(hash);
+
+    // On load-balanced RPC endpoints the receipt can come from a node that is
+    // ahead of the one serving subsequent eth_call reads; the follow-up deposit
+    // preflight would then still see the old allowance and report a bogus
+    // "insufficient allowance" revert. Wait until the new allowance is readable.
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const visible = await this.getTokenAllowance(walletClient.account.address, spender, token);
+      if (visible >= amount) return hash;
+      this.log('debug', 'Approval not yet visible on read node, waiting', {
+        attempt, visible: visible.toString(), required: amount.toString(),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    this.log('warn', 'Approval receipt confirmed but allowance still not visible after 10s', {
+      token, spender, txHash: hash,
+    });
     return hash;
   }
 
@@ -1732,61 +1922,74 @@ export class PalindromePaySDK {
       if (getAddress(arbiter) === getAddress(feeReceiver)) {
         throw new SDKError("Arbiter cannot be the fee receiver", SDKErrorCode.VALIDATION_ERROR);
       }
+      // Pre-check client-side so an ineligible arbiter fails with a clear
+      // message instead of an opaque on-chain revert / wallet gas error.
+      await this.assertArbiterIsEoa(arbiter);
     }
 
     const ipfsHash = params.ipfsHash ?? "";
 
-    // Predict next escrow ID and wallet address
-    const nextId = await this.getNextEscrowId();
-    const predictedWallet = await this.predictWalletAddress(nextId);
+    // Sign against the predicted escrow id, then submit. The signature is bound to
+    // the id read here, but the contract assigns nextEscrowId++ atomically; if the
+    // id drifts between read and execution (RPC lag, or the id consumed by another
+    // tx), the preflight surfaces InvalidWalletSignature and we re-read + re-sign
+    // once instead of leaking an opaque gas error to the wallet.
+    let hash: Hex;
+    let nextId: bigint;
+    for (let attempt = 1; ; attempt++) {
+      nextId = await this.getNextEscrowId();
+      const predictedWallet = await this.predictWalletAddress(nextId);
 
-    // Sign wallet authorization: seller pre-authorizes the COMPLETE (happy-path) payout
-    const sellerWalletSig = await this.signWalletAuthorization(
-      walletClient,
-      predictedWallet,
-      nextId,
-      EscrowState.COMPLETE,
-    );
+      const sellerWalletSig = await this.signCreateAuthorization(walletClient, predictedWallet, nextId);
 
-    // Pre-validate signature before submitting transaction
-    const isValidSig = await this.verifyWalletSignature(
-      sellerWalletSig,
-      predictedWallet,
-      nextId,
-      walletClient.account.address,
-      EscrowState.COMPLETE,
-    );
-
-    if (!isValidSig) {
-      throw new SDKError(
-        "Seller wallet signature is invalid - cannot create escrow",
-        SDKErrorCode.SIGNATURE_INVALID,
-      );
-    }
-
-    // Create escrow
-    const hash = await this.resilientWriteContract(walletClient, {
-      address: this.contractAddress,
-      abi: this.abiEscrow,
-      functionName: "createEscrow",
-      args: [
-        token,
-        buyer,
-        params.amount,
-        maturityDays,
-        arbiter,
-        arbiterFeeBps,
-        params.title,
-        ipfsHash,
+      const isValidSig = await this.verifyWalletSignature(
         sellerWalletSig,
-      ],
-    });
+        predictedWallet,
+        nextId,
+        walletClient.account.address,
+        EscrowState.COMPLETE,
+      );
+      if (!isValidSig) {
+        throw new SDKError(
+          "Seller wallet signature is invalid - cannot create escrow",
+          SDKErrorCode.SIGNATURE_INVALID,
+        );
+      }
+
+      await this.afterCreateSignHook();
+
+      try {
+        hash = await this.resilientWriteContract(walletClient, {
+          address: this.contractAddress,
+          abi: this.abiEscrow,
+          functionName: "createEscrow",
+          args: [
+            token,
+            buyer,
+            params.amount,
+            maturityDays,
+            arbiter,
+            arbiterFeeBps,
+            params.title,
+            ipfsHash,
+            sellerWalletSig,
+          ],
+        });
+        break;
+      } catch (error: unknown) {
+        // Id drift: the write failed and nextEscrowId moved since we signed (the
+        // signature is now bound to a stale id). Detect via the moved id — robust
+        // even when the RPC node masks the decoded InvalidWalletSignature revert.
+        const idMoved = attempt < 2 && (await this.getNextEscrowId()) !== nextId;
+        if (idMoved || (attempt < 2 && this.isIdDriftRevert(error))) {
+          this.log('warn', 'createEscrow: stale escrow id (id drift), re-signing against fresh nextEscrowId');
+          continue;
+        }
+        throw error;
+      }
+    }
 
     const receipt = await this.waitForReceipt(hash);
-
-    if (receipt.status !== "success") {
-      throw new SDKError("Transaction failed", SDKErrorCode.TRANSACTION_FAILED, { txHash: hash });
-    }
 
     // Parse event to get escrow ID
     const events = parseEventLogs({
@@ -1796,18 +1999,23 @@ export class PalindromePaySDK {
     }) as Array<{ args: EscrowCreatedEvent }>;
 
     const escrowId = events[0]?.args?.escrowId ?? nextId;
-    const deal = await this.getEscrowByIdParsed(escrowId);
+
+    // A stale cache entry for this id may exist (e.g. a pre-create poll cached
+    // the empty struct) — drop it and read back guaranteed-fresh state.
+    this.invalidateEscrow(escrowId);
+    await this.waitForEscrowVisible(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
 
     // Verify seller signature is valid on-chain after creation
     let sellerSigValid = false;
     let verificationError: string | undefined;
     try {
-      sellerSigValid = await this.publicClient.readContract({
+      sellerSigValid = await this.read<boolean>({
         address: deal.wallet,
         abi: this.abiWallet,
         functionName: "isSignatureValid",
         args: [walletClient.account.address, EscrowState.COMPLETE],
-      }) as boolean;
+      });
     } catch (error) {
       verificationError = error instanceof Error ? error.message : String(error);
       this.log('warn', 'Failed to verify seller signature after escrow creation', {
@@ -1893,6 +2101,7 @@ export class PalindromePaySDK {
       if (getAddress(arbiter) === getAddress(feeReceiver)) {
         throw new SDKError("Arbiter cannot be the fee receiver", SDKErrorCode.VALIDATION_ERROR);
       }
+      await this.assertArbiterIsEoa(arbiter);
     }
 
     const ipfsHash = params.ipfsHash ?? "";
@@ -1905,57 +2114,61 @@ export class PalindromePaySDK {
       params.amount,
     );
 
-    // Predict next escrow ID and wallet address
-    const nextId = await this.getNextEscrowId();
-    const predictedWallet = await this.predictWalletAddress(nextId);
+    // Sign against the predicted id then submit, with one id-drift self-heal (see
+    // createEscrow for the rationale).
+    let hash: Hex;
+    let nextId: bigint;
+    for (let attempt = 1; ; attempt++) {
+      nextId = await this.getNextEscrowId();
+      const predictedWallet = await this.predictWalletAddress(nextId);
 
-    // Sign wallet authorization: by funding, the buyer pre-authorizes the COMPLETE payout
-    const buyerWalletSig = await this.signWalletAuthorization(
-      walletClient,
-      predictedWallet,
-      nextId,
-      EscrowState.COMPLETE,
-    );
+      const buyerWalletSig = await this.signCreateAuthorization(walletClient, predictedWallet, nextId);
 
-    // Pre-validate signature before submitting transaction
-    const isValidSig = await this.verifyWalletSignature(
-      buyerWalletSig,
-      predictedWallet,
-      nextId,
-      walletClient.account.address,
-      EscrowState.COMPLETE,
-    );
-
-    if (!isValidSig) {
-      throw new SDKError(
-        "Buyer wallet signature is invalid - cannot create escrow",
-        SDKErrorCode.SIGNATURE_INVALID,
-      );
-    }
-
-    // Create escrow and deposit
-    const hash = await this.resilientWriteContract(walletClient, {
-      address: this.contractAddress,
-      abi: this.abiEscrow,
-      functionName: "createEscrowAndDeposit",
-      args: [
-        token,
-        seller,
-        params.amount,
-        maturityDays,
-        arbiter,
-        arbiterFeeBps,
-        params.title,
-        ipfsHash,
+      const isValidSig = await this.verifyWalletSignature(
         buyerWalletSig,
-      ],
-    });
+        predictedWallet,
+        nextId,
+        walletClient.account.address,
+        EscrowState.COMPLETE,
+      );
+      if (!isValidSig) {
+        throw new SDKError(
+          "Buyer wallet signature is invalid - cannot create escrow",
+          SDKErrorCode.SIGNATURE_INVALID,
+        );
+      }
+
+      await this.afterCreateSignHook();
+
+      try {
+        hash = await this.resilientWriteContract(walletClient, {
+          address: this.contractAddress,
+          abi: this.abiEscrow,
+          functionName: "createEscrowAndDeposit",
+          args: [
+            token,
+            seller,
+            params.amount,
+            maturityDays,
+            arbiter,
+            arbiterFeeBps,
+            params.title,
+            ipfsHash,
+            buyerWalletSig,
+          ],
+        });
+        break;
+      } catch (error: unknown) {
+        const idMoved = attempt < 2 && (await this.getNextEscrowId()) !== nextId;
+        if (idMoved || (attempt < 2 && this.isIdDriftRevert(error))) {
+          this.log('warn', 'createEscrowAndDeposit: stale escrow id (id drift), re-signing against fresh nextEscrowId');
+          continue;
+        }
+        throw error;
+      }
+    }
 
     const receipt = await this.waitForReceipt(hash);
-
-    if (receipt.status !== "success") {
-      throw new SDKError("Transaction failed", SDKErrorCode.TRANSACTION_FAILED, { txHash: hash });
-    }
 
     // Parse event to get escrow ID
     const events = parseEventLogs({
@@ -1965,18 +2178,23 @@ export class PalindromePaySDK {
     }) as Array<{ args: EscrowCreatedEvent }>;
 
     const escrowId = events[0]?.args?.escrowId ?? nextId;
-    const deal = await this.getEscrowByIdParsed(escrowId);
+
+    // A stale cache entry for this id may exist (e.g. a pre-create poll cached
+    // the empty struct) — drop it and read back guaranteed-fresh state.
+    this.invalidateEscrow(escrowId);
+    await this.waitForEscrowVisible(escrowId);
+    const deal = await this.getEscrowByIdParsed(escrowId, true);
 
     // Verify buyer signature is valid on-chain after creation
     let buyerSigValid = false;
     let verificationError: string | undefined;
     try {
-      buyerSigValid = await this.publicClient.readContract({
+      buyerSigValid = await this.read<boolean>({
         address: deal.wallet,
         abi: this.abiWallet,
         functionName: "isSignatureValid",
         args: [walletClient.account.address, EscrowState.COMPLETE],
-      }) as boolean;
+      });
     } catch (error) {
       verificationError = error instanceof Error ? error.message : String(error);
       this.log('warn', 'Failed to verify buyer signature after escrow creation', {
@@ -2081,18 +2299,17 @@ export class PalindromePaySDK {
       args: [escrowId, buyerWalletSig],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
 
     // Verify buyer signature is valid on-chain after deposit
     let buyerSigValid = false;
     try {
-      buyerSigValid = await this.publicClient.readContract({
+      buyerSigValid = await this.read<boolean>({
         address: deal.wallet,
         abi: this.abiWallet,
         functionName: "isSignatureValid",
         args: [walletClient.account.address, EscrowState.COMPLETE],
-      }) as boolean;
+      });
     } catch (error) {
       this.log('warn', 'Failed to verify buyer signature after deposit', {
         escrowId: escrowId.toString(),
@@ -2181,18 +2398,17 @@ export class PalindromePaySDK {
       args: [escrowId, sellerWalletSig],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
 
     // Verify seller signature is valid on-chain after accept
     let sellerSigValid = false;
     try {
-      sellerSigValid = await this.publicClient.readContract({
+      sellerSigValid = await this.read<boolean>({
         address: deal.wallet,
         abi: this.abiWallet,
         functionName: "isSignatureValid",
         args: [walletClient.account.address, EscrowState.COMPLETE],
-      }) as boolean;
+      });
     } catch (error) {
       this.log('warn', 'Failed to verify seller signature after accept', {
         escrowId: escrowId.toString(),
@@ -2277,8 +2493,7 @@ export class PalindromePaySDK {
       args: [escrowId, buyerWalletSig],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2322,8 +2537,7 @@ export class PalindromePaySDK {
       args: [escrowId, coordSignature, deadline, nonce, buyerWalletSig],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2450,8 +2664,7 @@ export class PalindromePaySDK {
       args: [escrowId, walletSig],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2493,8 +2706,7 @@ export class PalindromePaySDK {
       args: [escrowId],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2569,8 +2781,7 @@ export class PalindromePaySDK {
       args: [escrowId],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2612,8 +2823,7 @@ export class PalindromePaySDK {
       args: [escrowId],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2655,8 +2865,7 @@ export class PalindromePaySDK {
       args: [escrowId, signature, deadline, nonce],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2705,8 +2914,7 @@ export class PalindromePaySDK {
       args: [escrowId, role, ipfsHash],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2782,8 +2990,7 @@ export class PalindromePaySDK {
       args: [escrowId, resolution, ipfsHash, arbiterWalletSig],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2856,8 +3063,7 @@ export class PalindromePaySDK {
       args: [escrowId, buyerWalletSig],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -2916,10 +3122,7 @@ export class PalindromePaySDK {
     if (addressEquals(newArbiter, feeReceiver)) {
       throw new SDKError("Arbiter cannot be the fee receiver", SDKErrorCode.VALIDATION_ERROR);
     }
-    const arbiterCode = await this.publicClient.getCode({ address: newArbiter });
-    if (arbiterCode && arbiterCode !== "0x") {
-      throw new SDKError("Arbiter must be an EOA", SDKErrorCode.VALIDATION_ERROR);
-    }
+    await this.assertArbiterIsEoa(newArbiter);
     if (!Number.isInteger(arbiterFeeBps) || arbiterFeeBps < 0 || arbiterFeeBps > MAX_ARBITER_FEE_BPS) {
       throw new SDKError(
         `Arbiter fee must be an integer between 0 and ${MAX_ARBITER_FEE_BPS} bps (20%)`,
@@ -2962,8 +3165,7 @@ export class PalindromePaySDK {
       args: [escrowId, newArbiter, arbiterFeeBps, buyerSig, sellerSig, deadline, nonce],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -3018,8 +3220,7 @@ export class PalindromePaySDK {
       args: [],
     });
 
-    await this.waitForReceipt(hash);
-    this.invalidateEscrow(escrowId);
+    await this.confirmWrite(hash, escrowId);
     return hash;
   }
 
@@ -3233,10 +3434,10 @@ export class PalindromePaySDK {
         result,
       };
     } catch (error: unknown) {
-      // Extract revert reason
-      let revertReason = "Unknown error";
+      // Extract revert reason (shared decoder → decoded custom-error name when present)
+      let revertReason = this.extractRevertReason(error)?.reason ?? "Unknown error";
 
-      if (isViemError(error)) {
+      if (revertReason === "Unknown error" && isViemError(error)) {
         if (error.cause?.reason) {
           revertReason = error.cause.reason;
         } else if (hasShortMessage(error)) {
@@ -3455,7 +3656,7 @@ export class PalindromePaySDK {
     color: string;
     description: string;
   }> {
-    const cacheKey = `status-${escrowId}`;
+    const cacheKey = this.statusCacheKey(escrowId);
 
     if (!forceRefresh) {
       const cached = this.getCacheValue<{
@@ -3468,7 +3669,9 @@ export class PalindromePaySDK {
       if (cached) return cached;
     }
 
-    const deal = await this.getEscrowByIdParsed(escrowId);
+    // forceRefresh must also bypass the underlying escrow-data cache,
+    // otherwise the "fresh" status is derived from a stale deal snapshot.
+    const deal = await this.getEscrowByIdParsed(escrowId, forceRefresh);
     const statusInfo = this.getStatusLabel(deal.state);
 
     const result = {
